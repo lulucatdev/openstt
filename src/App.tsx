@@ -4,7 +4,6 @@ import {
   FileText,
   LayoutDashboard,
   Menu,
-  Mic,
   Settings,
   Trash2,
   X,
@@ -123,6 +122,16 @@ const formatLatency = (value?: number | null) => {
     return "n/a";
   }
   return `${value} ms`;
+};
+
+const detectSystemLanguage = (): "en" | "zh" => {
+  try {
+    const locale = new Intl.Locale(navigator.language).maximize();
+    if (locale.script === "Hans") return "zh";
+  } catch {
+    // fall through
+  }
+  return "en";
 };
 
 const defaultDictationShortcut: DictationShortcut = {
@@ -315,7 +324,7 @@ const translations = {
     cloudKeyRequiredProvider: "{provider} API key is required.",
     bigmodel: "BigModel",
     elevenlabs: "ElevenLabs",
-    cloudUsageTitle: "Cloud Usage",
+    cloudUsageTitle: "Cloud Model Usage",
     cloudUsageDesc: "Recent cloud request activity",
     cloudRequests: "Cloud requests",
     cloudLatency: "Last latency",
@@ -363,8 +372,13 @@ const translations = {
     aboutDesc: "Local speech to text gateway",
     build: "Build",
     portHint: "Port must be 1-65535",
-    pagePlayground: "Playground",
-    pagePlaygroundDesc: "Record and transcribe",
+    overviewModelTitle: "Model",
+    overviewModelDesc: "Active transcription model",
+    noActiveModel: "No model activated",
+    noActiveModelHint: "Go to Models to download and activate one",
+    manageModels: "Manage",
+    playgroundTitle: "Test Transcription",
+    playgroundDesc: "Record and transcribe to verify your setup",
     playgroundRecord: "Record",
     playgroundStop: "Stop & Transcribe",
     playgroundTranscribing: "Transcribing...",
@@ -481,7 +495,7 @@ const translations = {
     cloudKeyRequiredProvider: "需要先配置 {provider} API Key。",
     bigmodel: "BigModel",
     elevenlabs: "ElevenLabs",
-    cloudUsageTitle: "云端使用情况",
+    cloudUsageTitle: "云端模型使用情况",
     cloudUsageDesc: "最近的云端请求概览",
     cloudRequests: "云端请求",
     cloudLatency: "最近延迟",
@@ -529,8 +543,13 @@ const translations = {
     aboutDesc: "本地语音转文字网关",
     build: "版本",
     portHint: "端口必须在 1-65535 之间",
-    pagePlayground: "试听",
-    pagePlaygroundDesc: "录音并转写",
+    overviewModelTitle: "模型",
+    overviewModelDesc: "当前转写模型",
+    noActiveModel: "未启用任何模型",
+    noActiveModelHint: "前往模型页下载并启用",
+    manageModels: "管理",
+    playgroundTitle: "测试转写",
+    playgroundDesc: "录音并转写以验证配置",
     playgroundRecord: "录音",
     playgroundStop: "停止并转写",
     playgroundTranscribing: "转写中...",
@@ -559,7 +578,7 @@ function App() {
   const [initialized, setInitialized] = useState(false);
   const [uiSettings, setUiSettings] = useState<UiSettings>({
     reducedTransparency: false,
-    language: "en",
+    language: detectSystemLanguage(),
     bigmodelApiKey: "",
     bigmodelApiEndpoint: "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions",
     elevenlabsApiKey: "",
@@ -589,7 +608,7 @@ function App() {
   >("idle");
   const [playgroundText, setPlaygroundText] = useState("");
   const [activePage, setActivePage] = useState<
-    "overview" | "models" | "logs" | "settings" | "playground"
+    "overview" | "models" | "logs" | "settings"
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
@@ -640,12 +659,6 @@ function App() {
       label: t("pageLogs"),
       description: t("pageLogsDesc"),
       icon: FileText,
-    },
-    {
-      id: "playground",
-      label: t("pagePlayground"),
-      description: t("pagePlaygroundDesc"),
-      icon: Mic,
     },
     {
       id: "settings",
@@ -733,6 +746,7 @@ function App() {
         const settings = await invoke<UiSettings>("get_ui_settings");
         setUiSettings({
           ...settings,
+          language: settings.language ?? detectSystemLanguage(),
           dictationShortcut:
             settings.dictationShortcut ?? defaultDictationShortcut,
           dictationAutoPaste: settings.dictationAutoPaste ?? true,
@@ -932,8 +946,7 @@ function App() {
           page === "overview" ||
           page === "models" ||
           page === "logs" ||
-          page === "settings" ||
-          page === "playground"
+          page === "settings"
         ) {
           setActivePage(page);
           setDrawerOpen(false);
@@ -1601,6 +1614,183 @@ function App() {
                 <div className="card">
                   <div className="card-header">
                     <div>
+                      <h2>{t("overviewModelTitle")}</h2>
+                      <p className="muted">{t("overviewModelDesc")}</p>
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("activeModel")}
+                        </div>
+                        {!activeModelId && (
+                          <div className="settings-hint">
+                            {t("noActiveModelHint")}
+                          </div>
+                        )}
+                      </div>
+                      <div className="badge-row">
+                        <span className="badge">
+                          {activeModelId
+                            ? (models.find((m) => m.id === activeModelId)?.name ?? activeModelId)
+                            : t("noActiveModel")}
+                        </span>
+                        <button
+                          className="button tiny"
+                          onClick={() => setActivePage("models")}
+                        >
+                          {t("dictationShortcutChange")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("dictationTitle")}</h2>
+                      <p className="muted">{t("dictationDesc")}</p>
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("dictationShortcutLabel")}
+                        </div>
+                      </div>
+                      <div className="badge-row">
+                        <span className="badge">
+                          {dictationCapture
+                            ? t("dictationShortcutListening")
+                            : formatShortcutLabel(uiSettings.dictationShortcut)}
+                        </span>
+                        <button
+                          className="button tiny"
+                          onClick={() => setDictationCapture(!dictationCapture)}
+                        >
+                          {dictationCapture
+                            ? t("done")
+                            : t("dictationShortcutChange")}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("dictationAutoPaste")}
+                        </div>
+                        <div className="settings-hint">
+                          {t("dictationAutoPasteHint")}
+                        </div>
+                      </div>
+                      <button
+                        className={`switch ${
+                          uiSettings.dictationAutoPaste ? "is-on" : ""
+                        }`}
+                        onClick={() =>
+                          persistSettings({
+                            ...uiSettings,
+                            dictationAutoPaste: !uiSettings.dictationAutoPaste,
+                          })
+                        }
+                        aria-pressed={uiSettings.dictationAutoPaste}
+                      >
+                        <span className="switch-thumb" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("endpoints")}</h2>
+                      <p className="muted">{t("endpointsDesc")}</p>
+                    </div>
+                    <div className="pill">{t("openai")}</div>
+                  </div>
+
+                  <div className="endpoint-list">
+                    <div className="endpoint">
+                      <div className="endpoint-title">{t("transcriptions")}</div>
+                      <div className="endpoint-desc">
+                        {t("transcriptionsDesc")}
+                      </div>
+                      <div className="endpoint-actions">
+                        <code className="endpoint-code">{curlCommand}</code>
+                        <button className="button tiny" onClick={handleCopy}>
+                          {copied ? t("copied") : t("copy")}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="endpoint">
+                      <div className="endpoint-title">{t("healthEndpoint")}</div>
+                      <div className="endpoint-desc">
+                        {t("healthEndpointDesc")}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("playgroundTitle")}</h2>
+                      <p className="muted">{t("playgroundDesc")}</p>
+                    </div>
+                    <div className="badge-row">
+                      {playgroundStatus !== "idle" && (
+                        <span className="badge">
+                          {playgroundStatus === "recording"
+                            ? t("playgroundRecording")
+                            : t("playgroundTranscribing")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("playgroundRecord")}
+                        </div>
+                      </div>
+                      <div className="badge-row">
+                        <button
+                          className="button tiny primary"
+                          onClick={startPlaygroundRecording}
+                          disabled={playgroundStatus !== "idle"}
+                        >
+                          {t("playgroundRecord")}
+                        </button>
+                        <button
+                          className="button tiny"
+                          onClick={stopPlaygroundAndTranscribe}
+                          disabled={playgroundStatus !== "recording"}
+                        >
+                          {t("playgroundStop")}
+                        </button>
+                      </div>
+                    </div>
+                    {playgroundText && (
+                      <div className="settings-row">
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div className="settings-label">
+                            {t("playgroundPlaceholder")}
+                          </div>
+                          <div className="settings-hint">{playgroundText}</div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="card">
+                  <div className="card-header">
+                    <div>
                       <h2>{t("cloudUsageTitle")}</h2>
                       <p className="muted">{t("cloudUsageDesc")}</p>
                     </div>
@@ -1633,37 +1823,6 @@ function App() {
                       >
                         {cloudUsage?.lastError ?? t("cloudNoError")}
                       </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("endpoints")}</h2>
-                      <p className="muted">{t("endpointsDesc")}</p>
-                    </div>
-                    <div className="pill">{t("openai")}</div>
-                  </div>
-
-                  <div className="endpoint-list">
-                    <div className="endpoint">
-                      <div className="endpoint-title">{t("transcriptions")}</div>
-                      <div className="endpoint-desc">
-                        {t("transcriptionsDesc")}
-                      </div>
-                      <div className="endpoint-actions">
-                        <code className="endpoint-code">{curlCommand}</code>
-                        <button className="button tiny" onClick={handleCopy}>
-                          {copied ? t("copied") : t("copy")}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="endpoint">
-                      <div className="endpoint-title">{t("healthEndpoint")}</div>
-                      <div className="endpoint-desc">
-                        {t("healthEndpointDesc")}
-                      </div>
                     </div>
                   </div>
                 </div>
@@ -1999,42 +2158,6 @@ function App() {
                       </div>
                     ))
                   )}
-                </div>
-              </div>
-            )}
-
-            {activePage === "playground" && (
-              <div className="card">
-                <div className="playground-area">
-                  <button
-                    className={`playground-record-btn ${
-                      playgroundStatus === "recording" ? "is-recording" : ""
-                    }`}
-                    onClick={
-                      playgroundStatus === "idle"
-                        ? startPlaygroundRecording
-                        : playgroundStatus === "recording"
-                          ? stopPlaygroundAndTranscribe
-                          : undefined
-                    }
-                    disabled={playgroundStatus === "transcribing"}
-                  >
-                    <Mic size={28} />
-                  </button>
-                  <div className="playground-status">
-                    {playgroundStatus === "recording"
-                      ? t("playgroundRecording")
-                      : playgroundStatus === "transcribing"
-                        ? t("playgroundTranscribing")
-                        : t("playgroundRecord")}
-                  </div>
-                  <div className="playground-transcript">
-                    {playgroundText || (
-                      <span className="playground-placeholder">
-                        {t("playgroundPlaceholder")}
-                      </span>
-                    )}
-                  </div>
                 </div>
               </div>
             )}
