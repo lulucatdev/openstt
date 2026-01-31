@@ -55,7 +55,7 @@ struct AppState {
     active_model_id: Arc<Mutex<String>>,
     cached_context: Arc<Mutex<Option<CachedWhisperContext>>>,
     mlx_sidecar: Arc<Mutex<Option<MlxSidecar>>>,
-    cloud_usage: Arc<Mutex<CloudUsage>>,
+
     app_handle: Arc<Mutex<Option<tauri::AppHandle>>>,
     tray_snapshot: Arc<Mutex<Option<TraySnapshot>>>,
     dictation_shortcut: Arc<Mutex<Option<Shortcut>>>,
@@ -121,24 +121,11 @@ struct LogEntry {
     message: String,
 }
 
-#[derive(Serialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-struct CloudUsage {
-    requests: u64,
-    last_latency_ms: Option<u64>,
-    last_error: Option<String>,
-    last_provider: Option<String>,
-}
-
 #[derive(Clone, PartialEq)]
 struct TraySnapshot {
     running: bool,
     port: u16,
     model_id: String,
-    cloud_requests: u64,
-    cloud_latency_ms: Option<u64>,
-    cloud_provider: Option<String>,
-    cloud_error: Option<String>,
     dictation_state: String,
     dictation_queue_len: u32,
 }
@@ -195,25 +182,11 @@ struct ServerStatus {
     requests: u64,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudTestResult {
-    ok: bool,
-    latency_ms: Option<u64>,
-    message: String,
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 struct UiSettings {
     reduced_transparency: bool,
     language: String,
-    #[serde(alias = "cloudApiKey")]
-    bigmodel_api_key: String,
-    #[serde(alias = "cloudApiEndpoint")]
-    bigmodel_api_endpoint: String,
-    elevenlabs_api_key: String,
-    elevenlabs_api_endpoint: String,
     dictation_shortcut: DictationShortcut,
     dictation_auto_paste: bool,
 }
@@ -239,11 +212,6 @@ impl Default for UiSettings {
         Self {
             reduced_transparency: false,
             language: "en".to_string(),
-            bigmodel_api_key: String::new(),
-            bigmodel_api_endpoint: "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
-                .to_string(),
-            elevenlabs_api_key: String::new(),
-            elevenlabs_api_endpoint: "https://api.elevenlabs.io/v1/speech-to-text".to_string(),
             dictation_shortcut: DictationShortcut::default(),
             dictation_auto_paste: true,
         }
@@ -440,7 +408,7 @@ impl AppState {
             active_model_id: Arc::new(Mutex::new(default_model_id())),
             cached_context: Arc::new(Mutex::new(None)),
             mlx_sidecar: Arc::new(Mutex::new(None)),
-            cloud_usage: Arc::new(Mutex::new(CloudUsage::default())),
+
             app_handle: Arc::new(Mutex::new(None)),
             tray_snapshot: Arc::new(Mutex::new(None)),
             dictation_shortcut: Arc::new(Mutex::new(None)),
@@ -457,10 +425,7 @@ fn default_model_id() -> String {
 }
 
 fn normalize_model_id(model_id: &str) -> String {
-    match model_id {
-        "elevenlabs-scribe-v1" => "elevenlabs-scribe-v2".to_string(),
-        _ => model_id.to_string(),
-    }
+    model_id.to_string()
 }
 
 fn is_modifier_code(code: Code) -> bool {
@@ -643,31 +608,6 @@ fn open_page<R: tauri::Runtime>(app: &tauri::AppHandle<R>, page: &str) {
     let _ = app.emit("open-page", page);
 }
 
-fn format_tray_error(error: Option<String>) -> String {
-    match error {
-        Some(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                "Cloud error: none".to_string()
-            } else if trimmed.len() > 70 {
-                format!("Cloud error: {}...", &trimmed[..67])
-            } else {
-                format!("Cloud error: {trimmed}")
-            }
-        }
-        None => "Cloud error: none".to_string(),
-    }
-}
-
-fn format_tray_provider(provider: Option<String>) -> String {
-    match provider.as_deref() {
-        Some("elevenlabs") => "Cloud provider: ElevenLabs".to_string(),
-        Some("bigmodel") => "Cloud provider: BigModel".to_string(),
-        Some(other) => format!("Cloud provider: {other}"),
-        None => "Cloud provider: n/a".to_string(),
-    }
-}
-
 fn format_dictation_state(state: &str) -> &'static str {
     match state {
         "listening" => "Listening",
@@ -723,37 +663,6 @@ fn build_tray_menu<R: tauri::Runtime>(
         false,
         None::<String>,
     )?;
-    let cloud_requests_item = MenuItem::with_id(
-        app,
-        "tray-cloud-requests",
-        format!("Cloud requests: {}", snapshot.cloud_requests),
-        false,
-        None::<String>,
-    )?;
-    let cloud_latency_item = MenuItem::with_id(
-        app,
-        "tray-cloud-latency",
-        match snapshot.cloud_latency_ms {
-            Some(value) => format!("Cloud latency: {value} ms"),
-            None => "Cloud latency: n/a".to_string(),
-        },
-        false,
-        None::<String>,
-    )?;
-    let cloud_provider_item = MenuItem::with_id(
-        app,
-        "tray-cloud-provider",
-        format_tray_provider(snapshot.cloud_provider.clone()),
-        false,
-        None::<String>,
-    )?;
-    let cloud_error_item = MenuItem::with_id(
-        app,
-        "tray-cloud-error",
-        format_tray_error(snapshot.cloud_error.clone()),
-        false,
-        None::<String>,
-    )?;
     let dictation_item = MenuItem::with_id(
         app,
         "tray-dictation",
@@ -778,10 +687,6 @@ fn build_tray_menu<R: tauri::Runtime>(
     menu.append(&model_item)?;
     menu.append(&status_item)?;
     menu.append(&port_item)?;
-    menu.append(&cloud_requests_item)?;
-    menu.append(&cloud_provider_item)?;
-    menu.append(&cloud_latency_item)?;
-    menu.append(&cloud_error_item)?;
     menu.append(&dictation_item)?;
     menu.append(&dictation_queue_item)?;
     menu.append(&separator)?;
@@ -796,16 +701,11 @@ async fn tray_snapshot(state: &AppState) -> TraySnapshot {
     let running = state.runtime.lock().await.is_some();
     let port = *state.port.lock().await;
     let model_id = state.active_model_id.lock().await.clone();
-    let cloud = state.cloud_usage.lock().await.clone();
     let dictation = state.dictation_tray_state.lock().await.clone();
     TraySnapshot {
         running,
         port,
         model_id,
-        cloud_requests: cloud.requests,
-        cloud_latency_ms: cloud.last_latency_ms,
-        cloud_provider: cloud.last_provider,
-        cloud_error: cloud.last_error,
         dictation_state: dictation.state,
         dictation_queue_len: dictation.queue_len,
     }
@@ -962,58 +862,6 @@ fn venv_python_path() -> PathBuf {
 fn mlx_supported() -> bool {
     matches!(std::env::consts::ARCH, "aarch64" | "arm64")
         && std::env::consts::OS == "macos"
-}
-
-fn parse_cloud_provider(value: &str) -> Option<models::CloudProvider> {
-    match value.trim().to_lowercase().as_str() {
-        "bigmodel" | "zhipu" => Some(models::CloudProvider::BigModel),
-        "elevenlabs" | "eleven" => Some(models::CloudProvider::ElevenLabs),
-        _ => None,
-    }
-}
-
-fn default_cloud_endpoint(provider: models::CloudProvider) -> &'static str {
-    match provider {
-        models::CloudProvider::BigModel => {
-            "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
-        }
-        models::CloudProvider::ElevenLabs => "https://api.elevenlabs.io/v1/speech-to-text",
-    }
-}
-
-fn default_cloud_model(provider: models::CloudProvider) -> &'static str {
-    match provider {
-        models::CloudProvider::BigModel => "glm-asr-2512",
-        models::CloudProvider::ElevenLabs => "scribe_v2",
-    }
-}
-
-fn build_silence_wav(sample_rate: u32, duration_ms: u32) -> Vec<u8> {
-    let channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let bytes_per_sample = bits_per_sample / 8;
-    let num_samples = sample_rate.saturating_mul(duration_ms) / 1000;
-    let data_size = num_samples as u32 * channels as u32 * bytes_per_sample as u32;
-    let mut buffer = Vec::with_capacity(44 + data_size as usize);
-
-    buffer.extend_from_slice(b"RIFF");
-    buffer.extend_from_slice(&(36 + data_size).to_le_bytes());
-    buffer.extend_from_slice(b"WAVE");
-    buffer.extend_from_slice(b"fmt ");
-    buffer.extend_from_slice(&16u32.to_le_bytes());
-    buffer.extend_from_slice(&1u16.to_le_bytes());
-    buffer.extend_from_slice(&channels.to_le_bytes());
-    buffer.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * channels as u32 * bytes_per_sample as u32;
-    buffer.extend_from_slice(&byte_rate.to_le_bytes());
-    let block_align = channels * bytes_per_sample;
-    buffer.extend_from_slice(&block_align.to_le_bytes());
-    buffer.extend_from_slice(&bits_per_sample.to_le_bytes());
-    buffer.extend_from_slice(b"data");
-    buffer.extend_from_slice(&data_size.to_le_bytes());
-
-    buffer.resize(44 + data_size as usize, 0);
-    buffer
 }
 
 async fn run_python_check(python: &str, args: &[&str]) -> bool {
@@ -1398,154 +1246,6 @@ async fn mlx_transcribe(
     Ok(payload.text)
 }
 
-async fn update_cloud_usage(
-    state: &AppState,
-    provider: models::CloudProvider,
-    latency_ms: u64,
-    error: Option<String>,
-) {
-    let mut usage = state.cloud_usage.lock().await;
-    usage.requests += 1;
-    usage.last_latency_ms = Some(latency_ms);
-    usage.last_provider = Some(provider.as_str().to_string());
-    usage.last_error = error;
-    drop(usage);
-    refresh_tray(state).await;
-}
-
-async fn cloud_request(
-    provider: models::CloudProvider,
-    api_key: &str,
-    endpoint: &str,
-    model_name: &str,
-    file_name: Option<String>,
-    file_bytes: Vec<u8>,
-    prompt: Option<String>,
-) -> Result<String, String> {
-    let filename = file_name.unwrap_or_else(|| "audio.wav".to_string());
-    let part = reqwest::multipart::Part::bytes(file_bytes)
-        .file_name(filename)
-        .mime_str("application/octet-stream")
-        .map_err(|err| format!("Failed to build file part: {err}"))?;
-    let mut form = reqwest::multipart::Form::new().part("file", part);
-    match provider {
-        models::CloudProvider::BigModel => {
-            form = form.text("model", model_name.to_string()).text("stream", "false");
-            if let Some(prompt) = prompt {
-                if !prompt.trim().is_empty() {
-                    form = form.text("prompt", prompt);
-                }
-            }
-        }
-        models::CloudProvider::ElevenLabs => {
-            form = form.text("model_id", model_name.to_string());
-        }
-    }
-
-    let client = reqwest::Client::new();
-    let mut request = client.post(endpoint).multipart(form);
-    match provider {
-        models::CloudProvider::BigModel => {
-            request = request.bearer_auth(api_key);
-        }
-        models::CloudProvider::ElevenLabs => {
-            request = request.header("xi-api-key", api_key);
-        }
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("Cloud request failed: {err}"))?;
-    if !response.status().is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-            })
-            .unwrap_or(body);
-        return Err(format!("Cloud error: {message}"));
-    }
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|err| format!("Cloud response parse failed: {err}"))?;
-    if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
-        return Ok(text.to_string());
-    }
-    if let Some(transcripts) = payload.get("transcripts").and_then(|value| value.as_array()) {
-        let text = transcripts
-            .iter()
-            .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !text.is_empty() {
-            return Ok(text);
-        }
-    }
-    Err("Cloud response missing text".to_string())
-}
-
-async fn cloud_transcribe(
-    state: &AppState,
-    provider: models::CloudProvider,
-    model_name: &str,
-    file_name: Option<String>,
-    file_bytes: Vec<u8>,
-    prompt: Option<String>,
-    track_usage: bool,
-) -> Result<String, String> {
-    let settings = state.ui_settings.lock().await.clone();
-    let (api_key, endpoint) = match provider {
-        models::CloudProvider::BigModel => (
-            settings.bigmodel_api_key.trim().to_string(),
-            if settings.bigmodel_api_endpoint.trim().is_empty() {
-                default_cloud_endpoint(provider).to_string()
-            } else {
-                settings.bigmodel_api_endpoint.trim().to_string()
-            },
-        ),
-        models::CloudProvider::ElevenLabs => (
-            settings.elevenlabs_api_key.trim().to_string(),
-            if settings.elevenlabs_api_endpoint.trim().is_empty() {
-                default_cloud_endpoint(provider).to_string()
-            } else {
-                settings.elevenlabs_api_endpoint.trim().to_string()
-            },
-        ),
-    };
-    if api_key.is_empty() {
-        return Err("Cloud API key is not set".to_string());
-    }
-
-    let start = Instant::now();
-    let result = cloud_request(
-        provider,
-        &api_key,
-        &endpoint,
-        model_name,
-        file_name,
-        file_bytes,
-        prompt,
-    )
-    .await;
-    let latency_ms = start.elapsed().as_millis() as u64;
-    if track_usage {
-        update_cloud_usage(
-            state,
-            provider,
-            latency_ms,
-            result.as_ref().err().cloned(),
-        )
-        .await;
-    }
-    result
-}
-
 pub(crate) async fn transcribe_bytes(
     state: &AppState,
     model: Option<String>,
@@ -1590,31 +1290,6 @@ pub(crate) async fn transcribe_bytes(
             ),
         )
         .await;
-
-    if entry.engine == models::ModelEngine::Cloud {
-        let model_name = models::cloud_model_name(&model_id)
-            .unwrap_or("glm-asr-2512");
-        let provider = models::cloud_provider(&model_id)
-            .unwrap_or(models::CloudProvider::BigModel);
-        let text = match cloud_transcribe(
-            state,
-            provider,
-            model_name,
-            file_name.clone(),
-            file_bytes,
-            prompt.clone(),
-            true,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(err) => {
-                state.logs.push("error", err.clone()).await;
-                return Err(TranscribeError::bad_request(err));
-            }
-        };
-        return Ok(text);
-    }
 
     let extension = file_name
         .as_ref()
@@ -2066,53 +1741,6 @@ async fn paste_clipboard() -> Result<(), String> {
 
 
 #[tauri::command]
-async fn get_cloud_usage(state: TauriState<'_, AppState>) -> Result<CloudUsage, String> {
-    Ok(state.cloud_usage.lock().await.clone())
-}
-
-#[tauri::command]
-async fn test_cloud_api_key(
-    provider: String,
-    api_key: String,
-    endpoint: String,
-) -> Result<CloudTestResult, String> {
-    let provider =
-        parse_cloud_provider(&provider).ok_or_else(|| "Unknown provider".to_string())?;
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        return Err("API key is required".to_string());
-    }
-    let endpoint = if endpoint.trim().is_empty() {
-        default_cloud_endpoint(provider).to_string()
-    } else {
-        endpoint.trim().to_string()
-    };
-    let model_name = default_cloud_model(provider);
-    let audio = build_silence_wav(16_000, 800);
-    let start = Instant::now();
-    let result = cloud_request(
-        provider,
-        api_key,
-        &endpoint,
-        model_name,
-        Some("test.wav".to_string()),
-        audio,
-        None,
-    )
-    .await;
-    let latency_ms = start.elapsed().as_millis() as u64;
-    let (ok, message) = match result {
-        Ok(_) => (true, String::new()),
-        Err(err) => (false, err),
-    };
-    Ok(CloudTestResult {
-        ok,
-        latency_ms: Some(latency_ms),
-        message,
-    })
-}
-
-#[tauri::command]
 async fn list_models(state: TauriState<'_, AppState>) -> Result<Vec<models::ModelInfo>, String> {
     let dir = resolve_models_dir(&*state).await?;
     Ok(models::list_models(&dir))
@@ -2154,9 +1782,6 @@ async fn delete_model(state: TauriState<'_, AppState>, model_id: String) -> Resu
     let dir = resolve_models_dir(&*state).await?;
     let entry = models::model_entry(&model_id)
         .ok_or_else(|| format!("Unknown model: {model_id}"))?;
-    if entry.engine == models::ModelEngine::Cloud {
-        return Err("Cloud models have no local files".to_string());
-    }
     let path = models::model_path(&dir, &model_id)
         .ok_or_else(|| format!("Unknown model: {model_id}"))?;
     if entry.engine == models::ModelEngine::Mlx {
@@ -2250,13 +1875,6 @@ async fn download_model_inner(
     let dir = resolve_models_dir(state).await?;
     let entry = models::model_entry(model_id)
         .ok_or_else(|| format!("Unknown model: {model_id}"))?;
-    if entry.engine == models::ModelEngine::Cloud {
-        let models = models::list_models(&dir);
-        return models
-            .into_iter()
-            .find(|info| info.id == model_id)
-            .ok_or_else(|| "Model info unavailable".to_string());
-    }
     if entry.engine == models::ModelEngine::Mlx {
         prepare_mlx_model(state, &dir, entry).await?;
         let models = models::list_models(&dir);
@@ -2479,7 +2097,7 @@ async fn preload_active_model(state: &AppState) {
     match models::model_entry(&model_id).map(|e| e.engine) {
         Some(models::ModelEngine::Whisper) => preload_whisper_model(state).await,
         Some(models::ModelEngine::Mlx) => preload_mlx_model(state).await,
-        _ => {} // Cloud models don't need preloading
+        _ => {}
     }
     recompute_and_emit_app_status(state).await;
 }
@@ -2637,34 +2255,6 @@ async fn transcribe(
             ),
         )
         .await;
-
-    if entry.engine == models::ModelEngine::Cloud {
-        let model_name = models::cloud_model_name(&model_id)
-            .unwrap_or("glm-asr-2512");
-        let provider = models::cloud_provider(&model_id)
-            .unwrap_or(models::CloudProvider::BigModel);
-        let text = match cloud_transcribe(
-            &state,
-            provider,
-            model_name,
-            file_name.clone(),
-            file_bytes,
-            prompt.clone(),
-            true,
-        )
-        .await
-        {
-            Ok(text) => text,
-            Err(err) => {
-                state.logs.push("error", err.clone()).await;
-                return (StatusCode::BAD_REQUEST, err).into_response();
-            }
-        };
-        if response_format.as_deref() == Some("text") {
-            return text.into_response();
-        }
-        return Json(TranscriptionResponse { text }).into_response();
-    }
 
     let extension = file_name
         .as_ref()
@@ -2965,7 +2555,6 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&model_dir);
             let _ = std::fs::create_dir_all(model_dir.join("whisper"));
             let _ = std::fs::create_dir_all(model_dir.join("mlx"));
-            let _ = std::fs::create_dir_all(model_dir.join("cloud"));
             let _ = std::fs::create_dir_all(mlx_cache_dir());
             {
                 let mut model_guard = state.models_dir.blocking_lock();
@@ -2983,16 +2572,11 @@ pub fn run() {
                 let running = state.runtime.blocking_lock().is_some();
                 let port = *state.port.blocking_lock();
                 let model_id = state.active_model_id.blocking_lock().clone();
-                let cloud = state.cloud_usage.blocking_lock().clone();
                 let dictation = state.dictation_tray_state.blocking_lock().clone();
                 TraySnapshot {
                     running,
                     port,
                     model_id,
-                    cloud_requests: cloud.requests,
-                    cloud_latency_ms: cloud.last_latency_ms,
-                    cloud_provider: cloud.last_provider,
-                    cloud_error: cloud.last_error,
                     dictation_state: dictation.state,
                     dictation_queue_len: dictation.queue_len,
                 }
@@ -3083,8 +2667,7 @@ pub fn run() {
             clear_logs,
             get_ui_settings,
             set_ui_settings,
-            get_cloud_usage,
-            test_cloud_api_key,
+
             transcribe_audio,
             paste_clipboard,
             start_dictation,

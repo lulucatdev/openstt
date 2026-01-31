@@ -12,14 +12,12 @@ pub struct ModelInfo {
     pub downloaded: bool,
     pub local_path: Option<String>,
     pub engine: String,
-    pub provider: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ModelEngine {
     Whisper,
     Mlx,
-    Cloud,
 }
 
 impl ModelEngine {
@@ -27,22 +25,6 @@ impl ModelEngine {
         match self {
             ModelEngine::Whisper => "whisper",
             ModelEngine::Mlx => "mlx",
-            ModelEngine::Cloud => "cloud",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CloudProvider {
-    BigModel,
-    ElevenLabs,
-}
-
-impl CloudProvider {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CloudProvider::BigModel => "bigmodel",
-            CloudProvider::ElevenLabs => "elevenlabs",
         }
     }
 }
@@ -57,8 +39,6 @@ pub struct CatalogEntry {
     pub download_url: &'static str,
     pub engine: ModelEngine,
     pub storage_dir: &'static str,
-    pub remote_model: Option<&'static str>,
-    pub provider: Option<CloudProvider>,
 }
 
 const CATALOG: &[CatalogEntry] = &[
@@ -72,8 +52,6 @@ const CATALOG: &[CatalogEntry] = &[
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "large-v3",
@@ -84,8 +62,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "medium",
@@ -96,8 +72,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "small",
@@ -108,8 +82,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "base",
@@ -120,8 +92,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "tiny",
@@ -132,8 +102,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
         engine: ModelEngine::Whisper,
         storage_dir: "whisper",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "glm-asr-nano-4bit",
@@ -144,8 +112,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/GLM-ASR-Nano-2512-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "glm-asr-nano-8bit",
@@ -156,8 +122,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/GLM-ASR-Nano-2512-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "qwen3-asr-0.6b-4bit",
@@ -168,8 +132,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/Qwen3-ASR-0.6B-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "qwen3-asr-0.6b-8bit",
@@ -180,8 +142,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/Qwen3-ASR-0.6B-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "qwen3-asr-1.7b-4bit",
@@ -192,8 +152,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/Qwen3-ASR-1.7B-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "qwen3-asr-1.7b-8bit",
@@ -204,8 +162,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/Qwen3-ASR-1.7B-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-tiny-4bit",
@@ -216,8 +172,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-tiny-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-tiny-8bit",
@@ -228,8 +182,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-tiny-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-base-4bit",
@@ -240,8 +192,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-base-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-base-8bit",
@@ -252,8 +202,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-base-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-small-4bit",
@@ -264,8 +212,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-small-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-small-8bit",
@@ -276,8 +222,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-small-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-medium-4bit",
@@ -288,8 +232,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-medium-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-medium-8bit",
@@ -300,8 +242,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-medium-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-large-v3-4bit",
@@ -312,8 +252,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-large-v3-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-large-v3-8bit",
@@ -324,8 +262,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-large-v3-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-large-v3-turbo-4bit",
@@ -336,8 +272,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-large-v3-turbo-4bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
     },
     CatalogEntry {
         id: "whisper-large-v3-turbo-8bit",
@@ -348,32 +282,6 @@ const CATALOG: &[CatalogEntry] = &[
         download_url: "mlx-community/whisper-large-v3-turbo-8bit",
         engine: ModelEngine::Mlx,
         storage_dir: "mlx",
-        remote_model: None,
-        provider: None,
-    },
-    CatalogEntry {
-        id: "glm-asr-2512",
-        name: "GLM-ASR-2512 (Cloud)",
-        size: "Cloud",
-        description: "Zhipu GLM-ASR-2512 API",
-        filename: "glm-asr-2512.cloud",
-        download_url: "",
-        engine: ModelEngine::Cloud,
-        storage_dir: "cloud",
-        remote_model: Some("glm-asr-2512"),
-        provider: Some(CloudProvider::BigModel),
-    },
-    CatalogEntry {
-        id: "elevenlabs-scribe-v2",
-        name: "ElevenLabs Scribe v2",
-        size: "Cloud",
-        description: "ElevenLabs speech-to-text",
-        filename: "elevenlabs-scribe-v2.cloud",
-        download_url: "https://api.elevenlabs.io/v1/speech-to-text",
-        engine: ModelEngine::Cloud,
-        storage_dir: "cloud",
-        remote_model: Some("scribe_v2"),
-        provider: Some(CloudProvider::ElevenLabs),
     },
 ];
 
@@ -386,11 +294,7 @@ pub fn list_models(models_dir: &Path) -> Vec<ModelInfo> {
         .iter()
         .map(|entry| {
             let path = storage_path(models_dir, *entry);
-            let downloaded = if entry.engine == ModelEngine::Cloud {
-                true
-            } else {
-                path.exists()
-            };
+            let downloaded = path.exists();
             ModelInfo {
                 id: entry.id.to_string(),
                 name: entry.name.to_string(),
@@ -398,13 +302,8 @@ pub fn list_models(models_dir: &Path) -> Vec<ModelInfo> {
                 description: entry.description.to_string(),
                 download_url: entry.download_url.to_string(),
                 downloaded,
-                local_path: if entry.engine == ModelEngine::Cloud {
-                    None
-                } else {
-                    downloaded.then(|| path.to_string_lossy().to_string())
-                },
+                local_path: downloaded.then(|| path.to_string_lossy().to_string()),
                 engine: entry.engine.as_str().to_string(),
-                provider: entry.provider.map(|provider| provider.as_str().to_string()),
             }
         })
         .collect()
@@ -416,16 +315,5 @@ pub fn model_entry(model_id: &str) -> Option<CatalogEntry> {
 
 pub fn model_path(models_dir: &Path, model_id: &str) -> Option<PathBuf> {
     let entry = model_entry(model_id)?;
-    if entry.engine == ModelEngine::Cloud {
-        return None;
-    }
     Some(storage_path(models_dir, entry))
-}
-
-pub fn cloud_model_name(model_id: &str) -> Option<&'static str> {
-    model_entry(model_id).and_then(|entry| entry.remote_model)
-}
-
-pub fn cloud_provider(model_id: &str) -> Option<CloudProvider> {
-    model_entry(model_id).and_then(|entry| entry.provider)
 }

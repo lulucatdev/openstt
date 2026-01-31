@@ -25,10 +25,6 @@ type ServerStatus = {
 type UiSettings = {
   reducedTransparency: boolean;
   language: "en" | "zh";
-  bigmodelApiKey: string;
-  bigmodelApiEndpoint: string;
-  elevenlabsApiKey: string;
-  elevenlabsApiEndpoint: string;
   dictationShortcut: DictationShortcut;
   dictationAutoPaste: boolean;
 };
@@ -47,28 +43,6 @@ type ModelInfo = {
   downloaded: boolean;
   localPath: string | null;
   engine: string;
-  provider?: string | null;
-};
-
-type CloudProvider = "bigmodel" | "elevenlabs";
-
-type CloudUsage = {
-  requests: number;
-  lastLatencyMs: number | null;
-  lastError: string | null;
-  lastProvider: string | null;
-};
-
-type CloudTestResult = {
-  ok: boolean;
-  latencyMs: number | null;
-  message: string;
-};
-
-type CloudTestState = {
-  status: "idle" | "testing" | "success" | "error";
-  latencyMs?: number | null;
-  message?: string;
 };
 
 type DictationStateEvent = {
@@ -121,13 +95,6 @@ const formatTimestamp = (value?: number | null) => {
     minute: "2-digit",
     second: "2-digit",
   });
-};
-
-const formatLatency = (value?: number | null) => {
-  if (value === null || value === undefined) {
-    return "n/a";
-  }
-  return `${value} ms`;
 };
 
 const detectSystemLanguage = (): "en" | "zh" => {
@@ -265,7 +232,7 @@ const translations = {
     copied: "Copied",
     copy: "Copy",
     modelsTitle: "Models",
-    modelsDesc: "Manage local and cloud models",
+    modelsDesc: "Manage local models",
     noModels: "No models available yet.",
     active: "Active",
     activate: "Activate",
@@ -300,42 +267,10 @@ const translations = {
     viewLogs: "View logs",
     live: "Live",
     localModels: "Local Models",
-    cloudModels: "Cloud Models",
     whisperModels: "Whisper Models",
     mlxModels: "MLX Models",
     mlxRecommendation: "MLX models run faster on Apple Silicon. Switch to MLX Models tab for better performance.",
     switchToMlx: "Switch to MLX",
-    cloudSettings: "Cloud",
-    apiKey: "API Key",
-    apiKeyHint: "Stored locally in ~/.openstt/settings.json",
-    apiEndpoint: "API Endpoint",
-    apiEndpointHint: "BigModel transcription endpoint",
-    bigmodelKeyHint: "BigModel API key",
-    bigmodelEndpointHint: "BigModel transcription endpoint",
-    elevenlabsKeyHint: "ElevenLabs API key",
-    elevenlabsEndpointHint: "ElevenLabs speech-to-text endpoint",
-    save: "Save",
-    saved: "Saved",
-    configure: "Configure",
-    all: "All",
-    test: "Test",
-    testKey: "Test API key",
-    testKeyHint: "Send a short request to validate",
-    testing: "Testing...",
-    testSuccess: "Valid",
-    testSuccessLatency: "Valid ({ms} ms)",
-    testFailed: "Test failed",
-    apiKeyRequired: "API key required",
-    cloudKeyRequired: "Cloud API key is required.",
-    cloudKeyRequiredProvider: "{provider} API key is required.",
-    bigmodel: "BigModel",
-    elevenlabs: "ElevenLabs",
-    cloudUsageTitle: "Cloud Model Usage",
-    cloudUsageDesc: "Recent cloud request activity",
-    cloudRequests: "Cloud requests",
-    cloudLatency: "Last latency",
-    cloudLastError: "Last error",
-    cloudNoError: "No errors",
     appearance: "Appearance",
     reducedTransparency: "Reduced transparency",
     reducedTransparencyHint: "Use solid surfaces for better contrast",
@@ -442,7 +377,7 @@ const translations = {
     copied: "已复制",
     copy: "复制",
     modelsTitle: "模型",
-    modelsDesc: "管理本地与云端模型",
+    modelsDesc: "管理本地模型",
     noModels: "暂无可用模型。",
     active: "已启用",
     activate: "启用",
@@ -477,42 +412,10 @@ const translations = {
     viewLogs: "查看日志",
     live: "实时",
     localModels: "本地模型",
-    cloudModels: "云端模型",
     whisperModels: "Whisper 模型",
     mlxModels: "MLX 模型",
     mlxRecommendation: "MLX 模型在 Apple Silicon 上运行更快。切换到 MLX 模型以获得更好的性能。",
     switchToMlx: "切换到 MLX",
-    cloudSettings: "云端",
-    apiKey: "API Key",
-    apiKeyHint: "本地保存于 ~/.openstt/settings.json",
-    apiEndpoint: "API 接口",
-    apiEndpointHint: "BigModel 语音转写接口",
-    bigmodelKeyHint: "BigModel API Key",
-    bigmodelEndpointHint: "BigModel 语音转写接口",
-    elevenlabsKeyHint: "ElevenLabs API Key",
-    elevenlabsEndpointHint: "ElevenLabs 语音转写接口",
-    save: "保存",
-    saved: "已保存",
-    configure: "配置",
-    all: "全部",
-    test: "测试",
-    testKey: "测试 API Key",
-    testKeyHint: "发送一次简短请求验证",
-    testing: "测试中...",
-    testSuccess: "已验证",
-    testSuccessLatency: "已验证（{ms} ms）",
-    testFailed: "测试失败",
-    apiKeyRequired: "需要 API Key",
-    cloudKeyRequired: "需要先配置云端 API Key。",
-    cloudKeyRequiredProvider: "需要先配置 {provider} API Key。",
-    bigmodel: "BigModel",
-    elevenlabs: "ElevenLabs",
-    cloudUsageTitle: "云端模型使用情况",
-    cloudUsageDesc: "最近的云端请求概览",
-    cloudRequests: "云端请求",
-    cloudLatency: "最近延迟",
-    cloudLastError: "最近错误",
-    cloudNoError: "暂无错误",
     appearance: "外观",
     reducedTransparency: "减少透明度",
     reducedTransparencyHint: "使用更实的表面以提升对比度",
@@ -587,7 +490,6 @@ function App() {
   >("stopped");
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [cloudUsage, setCloudUsage] = useState<CloudUsage | null>(null);
   const [portInput, setPortInput] = useState(String(fallbackPort));
   const [error, setError] = useState<string | null>(null);
   const [permissionError, setPermissionError] = useState<"microphone" | null>(null);
@@ -597,24 +499,8 @@ function App() {
   const [uiSettings, setUiSettings] = useState<UiSettings>({
     reducedTransparency: false,
     language: detectSystemLanguage(),
-    bigmodelApiKey: "",
-    bigmodelApiEndpoint: "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions",
-    elevenlabsApiKey: "",
-    elevenlabsApiEndpoint: "https://api.elevenlabs.io/v1/speech-to-text",
     dictationShortcut: defaultDictationShortcut,
     dictationAutoPaste: true,
-  });
-  const [bigmodelKeyInput, setBigmodelKeyInput] = useState("");
-  const [bigmodelEndpointInput, setBigmodelEndpointInput] = useState("");
-  const [elevenlabsKeyInput, setElevenlabsKeyInput] = useState("");
-  const [elevenlabsEndpointInput, setElevenlabsEndpointInput] = useState("");
-  const [cloudDirty, setCloudDirty] = useState(false);
-  const [cloudFilter, setCloudFilter] = useState<"all" | CloudProvider>("all");
-  const [cloudTests, setCloudTests] = useState<
-    Record<CloudProvider, CloudTestState>
-  >({
-    bigmodel: { status: "idle" },
-    elevenlabs: { status: "idle" },
   });
   const [dictationCapture, setDictationCapture] = useState(false);
   const [dictationState, setDictationState] = useState<
@@ -630,7 +516,7 @@ function App() {
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
-  const [modelsTab, setModelsTab] = useState<"whisper" | "mlx-local" | "cloud">(
+  const [modelsTab, setModelsTab] = useState<"whisper" | "mlx-local">(
     "mlx-local",
   );
   const [mlxDeps, setMlxDeps] = useState<MlxDependencyStatus | null>(null);
@@ -722,15 +608,6 @@ function App() {
     }
   };
 
-  const refreshCloudUsage = async () => {
-    try {
-      const next = await invoke<CloudUsage>("get_cloud_usage");
-      setCloudUsage(next);
-    } catch (err) {
-      setError(String(err));
-    }
-  };
-
   const refreshModels = async () => {
     try {
       const [list, active] = await Promise.all([
@@ -739,8 +616,8 @@ function App() {
       ]);
       setModels(list);
       const activeModel = list.find((m) => m.id === active);
-      if (activeModel && !activeModel.downloaded && activeModel.engine !== "cloud") {
-        const fallback = list.find((m) => m.downloaded && m.engine !== "cloud");
+      if (activeModel && !activeModel.downloaded) {
+        const fallback = list.find((m) => m.downloaded);
         if (fallback) {
           try {
             const next = await invoke<string>("set_active_model", { modelId: fallback.id });
@@ -773,7 +650,6 @@ function App() {
   useEffect(() => {
     void refreshStatus();
     void refreshLogs();
-    void refreshCloudUsage();
     void refreshModels();
     void refreshMlxDeps();
     void invoke<LegacyModelsInfo>("check_legacy_models").then(setLegacyModels).catch(() => {});
@@ -793,7 +669,6 @@ function App() {
     })();
     const timer = setInterval(() => {
       void refreshStatus();
-      void refreshCloudUsage();
     }, 2000);
     return () => clearInterval(timer);
   }, []);
@@ -868,71 +743,8 @@ function App() {
     activePage === "logs" || mlxAction === "install" || mlxAction === "setup";
   const whisperModels = models.filter((model) => model.engine === "whisper");
   const mlxLocalModels = models.filter(
-    (model) => model.engine !== "whisper" && model.engine !== "cloud",
+    (model) => model.engine !== "whisper",
   );
-  const cloudModels = models.filter((model) => model.engine === "cloud");
-  const cloudProviderCounts = useMemo(() => {
-    const counts = {
-      all: cloudModels.length,
-      bigmodel: 0,
-      elevenlabs: 0,
-    };
-    for (const model of cloudModels) {
-      if (model.provider === "elevenlabs") {
-        counts.elevenlabs += 1;
-      } else if (model.provider === "bigmodel") {
-        counts.bigmodel += 1;
-      }
-    }
-    return counts;
-  }, [cloudModels]);
-  const filteredCloudModels = cloudModels.filter((model) => {
-    if (cloudFilter === "all") {
-      return true;
-    }
-    return model.provider === cloudFilter;
-  });
-
-  const providerLabel = (provider?: string | null) =>
-    provider === "elevenlabs" ? t("elevenlabs") : t("bigmodel");
-
-  const providerKey = (provider?: string | null) =>
-    provider === "elevenlabs"
-      ? uiSettings.elevenlabsApiKey
-      : uiSettings.bigmodelApiKey;
-
-  const providerInputKey = (provider: CloudProvider) =>
-    provider === "elevenlabs" ? elevenlabsKeyInput : bigmodelKeyInput;
-
-  const providerInputEndpoint = (provider: CloudProvider) =>
-    provider === "elevenlabs"
-      ? elevenlabsEndpointInput
-      : bigmodelEndpointInput;
-  const bigmodelKeyMissing = !bigmodelKeyInput.trim();
-  const elevenlabsKeyMissing = !elevenlabsKeyInput.trim();
-
-  useEffect(() => {
-    setBigmodelKeyInput(uiSettings.bigmodelApiKey ?? "");
-    setBigmodelEndpointInput(
-      uiSettings.bigmodelApiEndpoint ||
-        "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions",
-    );
-    setElevenlabsKeyInput(uiSettings.elevenlabsApiKey ?? "");
-    setElevenlabsEndpointInput(
-      uiSettings.elevenlabsApiEndpoint ||
-        "https://api.elevenlabs.io/v1/speech-to-text",
-    );
-    setCloudDirty(false);
-    setCloudTests({
-      bigmodel: { status: "idle" },
-      elevenlabs: { status: "idle" },
-    });
-  }, [
-    uiSettings.bigmodelApiKey,
-    uiSettings.bigmodelApiEndpoint,
-    uiSettings.elevenlabsApiKey,
-    uiSettings.elevenlabsApiEndpoint,
-  ]);
 
   useEffect(() => {
     if (activePage !== "models") {
@@ -940,13 +752,6 @@ function App() {
       setDeleteConfirmId(null);
     }
   }, [activePage]);
-
-  useEffect(() => {
-    if (modelsTab === "cloud") {
-      setModelsEditing(false);
-      setDeleteConfirmId(null);
-    }
-  }, [modelsTab]);
 
   useEffect(() => {
     const interval = logsStreaming ? 700 : 2000;
@@ -1182,23 +987,6 @@ function App() {
     await persistSettings({ ...uiSettings, language: next });
   };
 
-  const handleSaveCloudSettings = async () => {
-    const bigmodelEndpoint = bigmodelEndpointInput.trim();
-    const bigmodelKey = bigmodelKeyInput.trim();
-    const elevenlabsEndpoint = elevenlabsEndpointInput.trim();
-    const elevenlabsKey = elevenlabsKeyInput.trim();
-    const updated = await persistSettings({
-      ...uiSettings,
-      bigmodelApiKey: bigmodelKey,
-      bigmodelApiEndpoint: bigmodelEndpoint,
-      elevenlabsApiKey: elevenlabsKey,
-      elevenlabsApiEndpoint: elevenlabsEndpoint,
-    });
-    if (updated) {
-      setCloudDirty(false);
-    }
-  };
-
   const handleRequestMicrophone = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1262,74 +1050,9 @@ function App() {
     return normalizeDictationShortcut({ key, modifiers });
   };
 
-  const cloudTestHint = (provider: CloudProvider) => {
-    const state = cloudTests[provider];
-    if (state.status === "testing") {
-      return t("testing");
-    }
-    if (state.status === "success") {
-      if (state.latencyMs !== undefined && state.latencyMs !== null) {
-        return t("testSuccessLatency", { ms: state.latencyMs });
-      }
-      return t("testSuccess");
-    }
-    if (state.status === "error") {
-      return state.message || t("testFailed");
-    }
-    return t("testKeyHint");
-  };
-
-  const handleTestCloudKey = async (provider: CloudProvider) => {
-    const apiKey = providerInputKey(provider).trim();
-    const endpoint = providerInputEndpoint(provider).trim();
-    if (!apiKey) {
-      setCloudTests((prev) => ({
-        ...prev,
-        [provider]: { status: "error", message: t("apiKeyRequired") },
-      }));
-      return;
-    }
-    setCloudTests((prev) => ({
-      ...prev,
-      [provider]: { status: "testing" },
-    }));
-    try {
-      const result = await invoke<CloudTestResult>("test_cloud_api_key", {
-        provider,
-        apiKey,
-        endpoint,
-      });
-      setCloudTests((prev) => ({
-        ...prev,
-        [provider]: {
-          status: result.ok ? "success" : "error",
-          latencyMs: result.latencyMs ?? null,
-          message: result.ok ? undefined : result.message || t("testFailed"),
-        },
-      }));
-    } catch (err) {
-      setCloudTests((prev) => ({
-        ...prev,
-        [provider]: { status: "error", message: String(err) },
-      }));
-    }
-  };
-
   const handleDownloadModel = async (modelId: string) => {
     setError(null);
     const model = models.find((item) => item.id === modelId);
-    if (model?.engine === "cloud") {
-      const key = providerKey(model.provider);
-      if (!key.trim()) {
-        setError(
-          t("cloudKeyRequiredProvider", {
-            provider: providerLabel(model.provider),
-          }),
-        );
-        setActivePage("settings");
-        return;
-      }
-    }
     if (model?.engine === "mlx" && !(mlxDeps?.ready ?? false)) {
       setError(t("runtimeRequired"));
       return;
@@ -1404,19 +1127,6 @@ function App() {
 
   const handleActivateModel = async (modelId: string) => {
     setError(null);
-    const model = models.find((item) => item.id === modelId);
-    if (model?.engine === "cloud") {
-      const key = providerKey(model.provider);
-      if (!key.trim()) {
-        setError(
-          t("cloudKeyRequiredProvider", {
-            provider: providerLabel(model.provider),
-          }),
-        );
-        setActivePage("settings");
-        return;
-      }
-    }
     setModelAction({ id: modelId, type: "activate" });
     try {
       const next = await invoke<string>("set_active_model", { modelId });
@@ -1532,7 +1242,7 @@ function App() {
                 </div>
               </div>
               <div className="content-actions" data-tauri-drag-region="false">
-                {activePage === "models" && modelsTab !== "cloud" ? (
+                {activePage === "models" ? (
                   <button
                     className="button tiny"
                     onClick={() => setModelsEditing((value) => !value)}
@@ -1818,44 +1528,6 @@ function App() {
                   </div>
                 </div>
 
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("cloudUsageTitle")}</h2>
-                      <p className="muted">{t("cloudUsageDesc")}</p>
-                    </div>
-                  </div>
-                  <div className="cloud-meta">
-                    <div className="cloud-meta-row">
-                      <span className="cloud-meta-label">
-                        {t("cloudRequests")}
-                      </span>
-                      <span className="cloud-meta-value">
-                        {cloudUsage?.requests ?? 0}
-                      </span>
-                    </div>
-                    <div className="cloud-meta-row">
-                      <span className="cloud-meta-label">
-                        {t("cloudLatency")}
-                      </span>
-                      <span className="cloud-meta-value">
-                        {formatLatency(cloudUsage?.lastLatencyMs)}
-                      </span>
-                    </div>
-                    <div className="cloud-meta-row">
-                      <span className="cloud-meta-label">
-                        {t("cloudLastError")}
-                      </span>
-                      <span
-                        className={`cloud-meta-value ${
-                          cloudUsage?.lastError ? "is-error" : ""
-                        }`}
-                      >
-                        {cloudUsage?.lastError ?? t("cloudNoError")}
-                      </span>
-                    </div>
-                  </div>
-                </div>
               </>
             )}
 
@@ -1890,53 +1562,7 @@ function App() {
                   >
                     {t("whisperModels")}
                   </button>
-                  <button
-                    className={`model-tab ${
-                      modelsTab === "cloud" ? "is-active" : ""
-                    }`}
-                    onClick={() => setModelsTab("cloud")}
-                  >
-                    {t("cloudModels")}
-                  </button>
                 </div>
-
-                {modelsTab === "cloud" && (
-                  <div className="cloud-filters">
-                    <button
-                      className={`filter-chip ${
-                        cloudFilter === "all" ? "is-active" : ""
-                      }`}
-                      onClick={() => setCloudFilter("all")}
-                    >
-                      {t("all")}
-                      <span className="filter-count">
-                        {cloudProviderCounts.all}
-                      </span>
-                    </button>
-                    <button
-                      className={`filter-chip ${
-                        cloudFilter === "bigmodel" ? "is-active" : ""
-                      }`}
-                      onClick={() => setCloudFilter("bigmodel")}
-                    >
-                      {t("bigmodel")}
-                      <span className="filter-count">
-                        {cloudProviderCounts.bigmodel}
-                      </span>
-                    </button>
-                    <button
-                      className={`filter-chip ${
-                        cloudFilter === "elevenlabs" ? "is-active" : ""
-                      }`}
-                      onClick={() => setCloudFilter("elevenlabs")}
-                    >
-                      {t("elevenlabs")}
-                      <span className="filter-count">
-                        {cloudProviderCounts.elevenlabs}
-                      </span>
-                    </button>
-                  </div>
-                )}
 
                 {modelsTab === "mlx-local" && mlxLocalModels.length > 0 && (
                   <div className="runtime-row">
@@ -1983,66 +1609,7 @@ function App() {
                   </div>
                 )}
 
-                {modelsTab === "cloud" ? (
-                  <div className="model-section">
-                    <div className="section-title">{t("cloudModels")}</div>
-                    <div className="model-list">
-                      {filteredCloudModels.length === 0 ? (
-                        <div className="empty">{t("noModels")}</div>
-                      ) : (
-                        filteredCloudModels.map((model) => {
-                          const isActive = model.id === activeModelId;
-                          const isActivating =
-                            modelAction?.id === model.id &&
-                            modelAction.type === "activate";
-                          const missingKey = !providerKey(model.provider).trim();
-                          const providerName = providerLabel(model.provider);
-                          return (
-                            <div
-                              key={model.id}
-                              className={`model-row ${isActive ? "is-active" : ""}`}
-                            >
-                              <div className="model-info">
-                                <div className="model-title">
-                                  <span>{model.name}</span>
-                                  <span className="model-size">{model.size}</span>
-                                  <span className="model-tag">{providerName}</span>
-                                </div>
-                                <div className="model-desc">{model.description}</div>
-                                {missingKey && (
-                                  <div className="model-note warning">
-                                    {t("apiKeyRequired")}
-                                  </div>
-                                )}
-                              </div>
-                              <div className="model-actions">
-                                {isActive ? (
-                                  <span className="pill">{t("active")}</span>
-                                ) : missingKey ? (
-                                  <button
-                                    className="button tiny ghost"
-                                    onClick={() => setActivePage("settings")}
-                                  >
-                                    {t("configure")}
-                                  </button>
-                                ) : (
-                                  <button
-                                    className="button tiny"
-                                    onClick={() => handleActivateModel(model.id)}
-                                    disabled={Boolean(modelAction)}
-                                  >
-                                    {isActivating ? t("activating") : t("activate")}
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="model-section">
+                <div className="model-section">
                     <div className="section-title">
                       {modelsTab === "whisper"
                         ? t("whisperModels")
@@ -2161,7 +1728,6 @@ function App() {
                       )}
                     </div>
                   </div>
-                )}
               </div>
             )}
 
@@ -2535,167 +2101,6 @@ function App() {
                         </button>
                       </div>
                     )}
-                  </div>
-                </div>
-
-                <div className="card settings-section">
-                  <h3>{t("cloudSettings")}</h3>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("bigmodel")}</div>
-                        <div className="settings-hint">{t("bigmodelKeyHint")}</div>
-                      </div>
-                      <input
-                        type="password"
-                        value={bigmodelKeyInput}
-                        onChange={(event) => {
-                          setBigmodelKeyInput(event.target.value);
-                          setCloudDirty(true);
-                          setCloudTests((prev) => ({
-                            ...prev,
-                            bigmodel: { status: "idle" },
-                          }));
-                        }}
-                        placeholder="sk-..."
-                        className="settings-input"
-                      />
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("apiEndpoint")}</div>
-                        <div className="settings-hint">{t("bigmodelEndpointHint")}</div>
-                      </div>
-                      <input
-                        type="text"
-                        value={bigmodelEndpointInput}
-                        onChange={(event) => {
-                          setBigmodelEndpointInput(event.target.value);
-                          setCloudDirty(true);
-                          setCloudTests((prev) => ({
-                            ...prev,
-                            bigmodel: { status: "idle" },
-                          }));
-                        }}
-                        className="settings-input"
-                      />
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("testKey")}</div>
-                        <div
-                          className={`settings-hint ${
-                            cloudTests.bigmodel.status === "error"
-                              ? "is-error"
-                              : cloudTests.bigmodel.status === "success"
-                                ? "is-success"
-                                : ""
-                          }`}
-                        >
-                          {cloudTestHint("bigmodel")}
-                        </div>
-                      </div>
-                      <button
-                        className="button tiny"
-                        onClick={() => handleTestCloudKey("bigmodel")}
-                        disabled={
-                          cloudTests.bigmodel.status === "testing" ||
-                          bigmodelKeyMissing
-                        }
-                      >
-                        {cloudTests.bigmodel.status === "testing"
-                          ? t("testing")
-                          : t("test")}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("elevenlabs")}</div>
-                        <div className="settings-hint">{t("elevenlabsKeyHint")}</div>
-                      </div>
-                      <input
-                        type="password"
-                        value={elevenlabsKeyInput}
-                        onChange={(event) => {
-                          setElevenlabsKeyInput(event.target.value);
-                          setCloudDirty(true);
-                          setCloudTests((prev) => ({
-                            ...prev,
-                            elevenlabs: { status: "idle" },
-                          }));
-                        }}
-                        placeholder="xi-..."
-                        className="settings-input"
-                      />
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("apiEndpoint")}</div>
-                        <div className="settings-hint">{t("elevenlabsEndpointHint")}</div>
-                      </div>
-                      <input
-                        type="text"
-                        value={elevenlabsEndpointInput}
-                        onChange={(event) => {
-                          setElevenlabsEndpointInput(event.target.value);
-                          setCloudDirty(true);
-                          setCloudTests((prev) => ({
-                            ...prev,
-                            elevenlabs: { status: "idle" },
-                          }));
-                        }}
-                        className="settings-input"
-                      />
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("testKey")}</div>
-                        <div
-                          className={`settings-hint ${
-                            cloudTests.elevenlabs.status === "error"
-                              ? "is-error"
-                              : cloudTests.elevenlabs.status === "success"
-                                ? "is-success"
-                                : ""
-                          }`}
-                        >
-                          {cloudTestHint("elevenlabs")}
-                        </div>
-                      </div>
-                      <button
-                        className="button tiny"
-                        onClick={() => handleTestCloudKey("elevenlabs")}
-                        disabled={
-                          cloudTests.elevenlabs.status === "testing" ||
-                          elevenlabsKeyMissing
-                        }
-                      >
-                        {cloudTests.elevenlabs.status === "testing"
-                          ? t("testing")
-                          : t("test")}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("save")}</div>
-                        <div className="settings-hint">
-                          {cloudDirty ? "" : t("saved")}
-                        </div>
-                      </div>
-                      <button
-                        className="button tiny"
-                        onClick={handleSaveCloudSettings}
-                        disabled={!cloudDirty}
-                      >
-                        {t("save")}
-                      </button>
-                    </div>
                   </div>
                 </div>
 

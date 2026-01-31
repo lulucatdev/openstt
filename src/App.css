@@ -696,39 +696,6 @@ select:focus {
   gap: 10px;
 }
 
-.cloud-meta {
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: #ffffff;
-  padding: 12px;
-  display: grid;
-  gap: 10px;
-}
-
-.cloud-meta-row {
-  display: grid;
-  grid-template-columns: 120px 1fr;
-  gap: 12px;
-  align-items: center;
-  font-size: 11px;
-}
-
-.cloud-meta-label {
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.cloud-meta-value {
-  color: var(--text-emphasis);
-  word-break: break-word;
-}
-
-.cloud-meta-value.is-error {
-  color: var(--status-error);
-}
-
 .meta-row {
   display: flex;
   justify-content: space-between;
@@ -846,14 +813,6 @@ select:focus {
   align-items: center;
   gap: 6px;
   padding: 6px 0 10px;
-}
-
-.cloud-filters {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  padding-bottom: 12px;
 }
 
 .filter-chip {
@@ -1448,10 +1407,6 @@ select:focus {
   .settings-row {
     flex-direction: column;
     align-items: flex-start;
-  }
-
-  .cloud-meta-row {
-    grid-template-columns: 1fr;
   }
 
   .shortcut-control {

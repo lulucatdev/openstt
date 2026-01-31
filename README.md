@@ -1,12 +1,12 @@
 # OpenSTT
 
-Local-first speech-to-text hub with local and cloud engines.
+Local-first speech-to-text hub with multiple local engines.
 
-A native macOS app that unifies Whisper, GLM-4-Voice (via MLX), and cloud providers (BigModel, ElevenLabs) behind a single OpenAI-compatible API endpoint — plus system-wide dictation with a global hotkey.
+A native macOS app that unifies Whisper and MLX models behind a single OpenAI-compatible API endpoint — plus system-wide dictation with a global hotkey.
 
 ## Features
 
-- **Multiple engines** — Local Whisper (whisper.cpp), local GLM-4-Voice (MLX on Apple Silicon), cloud BigModel & ElevenLabs
+- **Multiple engines** — Local Whisper (whisper.cpp), local MLX models (on Apple Silicon)
 - **OpenAI-compatible API** — `POST /v1/audio/transcriptions` on localhost, drop-in replacement
 - **System-wide dictation** — Hold a global shortcut to record, release to transcribe, auto-paste into any app
 - **Model management** — Download, switch, and delete models from the GUI
@@ -43,13 +43,13 @@ MIT
 
 # OpenSTT
 
-聚合本地与云端引擎的语音转文字 Hub。
+聚合多种本地引擎的语音转文字 Hub。
 
-一个原生 macOS 应用，将 Whisper、GLM-4-Voice（通过 MLX）和云端服务商（BigModel、ElevenLabs）统一在一个 OpenAI 兼容的 API 端点之后，同时提供全局快捷键系统级听写。
+一个原生 macOS 应用，将 Whisper 和 MLX 模型统一在一个 OpenAI 兼容的 API 端点之后，同时提供全局快捷键系统级听写。
 
 ## 功能
 
-- **多引擎支持** — 本地 Whisper (whisper.cpp)、本地 GLM-4-Voice (Apple Silicon MLX)、云端 BigModel 和 ElevenLabs
+- **多引擎支持** — 本地 Whisper (whisper.cpp)、本地 MLX 模型 (Apple Silicon)
 - **OpenAI 兼容 API** — 本地 `POST /v1/audio/transcriptions`，可直接替换
 - **系统级听写** — 按住全局快捷键录音，松开转写，自动粘贴到当前应用
 - **模型管理** — 在界面中下载、切换、删除模型
