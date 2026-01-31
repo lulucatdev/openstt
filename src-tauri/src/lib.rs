@@ -1,0 +1,2675 @@
+mod audio;
+mod models;
+
+use axum::{
+    extract::{Multipart, State as AxumState},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::{
+    io::BufRead,
+    process::Stdio,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use tauri::{Emitter, Manager, State as TauriState};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+#[cfg(target_os = "macos")]
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+#[cfg(target_os = "macos")]
+use core_graphics::event::{
+    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, EventField, KeyCode,
+};
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    sync::{oneshot, Mutex},
+    time::{sleep, Duration},
+};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+#[derive(Clone)]
+struct AppState {
+    runtime: Arc<Mutex<Option<ServerRuntime>>>,
+    port: Arc<Mutex<u16>>,
+    started_at: Arc<Mutex<Option<u64>>>,
+    requests: Arc<Mutex<u64>>,
+    logs: Arc<LogStore>,
+    ui_settings: Arc<Mutex<UiSettings>>,
+    settings_path: Arc<Mutex<Option<PathBuf>>>,
+    models_dir: Arc<Mutex<Option<PathBuf>>>,
+    config_path: Arc<Mutex<Option<PathBuf>>>,
+    active_model_id: Arc<Mutex<String>>,
+    cached_context: Arc<Mutex<Option<CachedWhisperContext>>>,
+    glm_sidecar: Arc<Mutex<Option<GlmSidecar>>>,
+    cloud_usage: Arc<Mutex<CloudUsage>>,
+    app_handle: Arc<Mutex<Option<tauri::AppHandle>>>,
+    tray_snapshot: Arc<Mutex<Option<TraySnapshot>>>,
+    dictation_shortcut: Arc<Mutex<Option<Shortcut>>>,
+    dictation_tray_state: Arc<Mutex<DictationTrayState>>,
+}
+
+struct ServerRuntime {
+    shutdown: oneshot::Sender<()>,
+    handle: tauri::async_runtime::JoinHandle<()>,
+}
+
+struct LogStore {
+    state: Mutex<LogState>,
+    max_entries: usize,
+    log_path: Mutex<Option<PathBuf>>,
+}
+
+struct GlmSidecar {
+    model_id: String,
+    port: u16,
+    child: tokio::process::Child,
+}
+
+const TRAY_ID: &str = "openstt-tray";
+const TRAY_OPEN: &str = "tray-open";
+const TRAY_START: &str = "tray-start";
+const TRAY_STOP: &str = "tray-stop";
+const TRAY_SETTINGS: &str = "tray-settings";
+const TRAY_LOGS: &str = "tray-logs";
+const TRAY_QUIT: &str = "tray-quit";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GlmDependencyStatus {
+    supported: bool,
+    ready: bool,
+    python: Option<String>,
+    venv: bool,
+    mlx_audio: bool,
+    message: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedWhisperContext {
+    model_id: String,
+    context: Arc<WhisperContext>,
+}
+
+struct LogState {
+    next_id: u64,
+    entries: Vec<LogEntry>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LogEntry {
+    id: u64,
+    timestamp: u64,
+    level: String,
+    message: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct CloudUsage {
+    requests: u64,
+    last_latency_ms: Option<u64>,
+    last_error: Option<String>,
+    last_provider: Option<String>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TraySnapshot {
+    running: bool,
+    port: u16,
+    model_id: String,
+    cloud_requests: u64,
+    cloud_latency_ms: Option<u64>,
+    cloud_provider: Option<String>,
+    cloud_error: Option<String>,
+    dictation_state: String,
+    dictation_queue_len: u32,
+}
+
+#[derive(Clone, PartialEq)]
+struct DictationTrayState {
+    state: String,
+    queue_len: u32,
+}
+
+impl Default for DictationTrayState {
+    fn default() -> Self {
+        Self {
+            state: "idle".to_string(),
+            queue_len: 0,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerStatus {
+    running: bool,
+    port: u16,
+    url: Option<String>,
+    started_at: Option<u64>,
+    requests: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudTestResult {
+    ok: bool,
+    latency_ms: Option<u64>,
+    message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct UiSettings {
+    reduced_transparency: bool,
+    language: String,
+    #[serde(alias = "cloudApiKey")]
+    bigmodel_api_key: String,
+    #[serde(alias = "cloudApiEndpoint")]
+    bigmodel_api_endpoint: String,
+    elevenlabs_api_key: String,
+    elevenlabs_api_endpoint: String,
+    dictation_shortcut: DictationShortcut,
+    dictation_auto_paste: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct DictationShortcut {
+    key: String,
+    modifiers: Vec<String>,
+}
+
+impl Default for DictationShortcut {
+    fn default() -> Self {
+        Self {
+            key: "AltLeft".to_string(),
+            modifiers: Vec::new(),
+        }
+    }
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            reduced_transparency: false,
+            language: "en".to_string(),
+            bigmodel_api_key: String::new(),
+            bigmodel_api_endpoint: "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
+                .to_string(),
+            elevenlabs_api_key: String::new(),
+            elevenlabs_api_endpoint: "https://api.elevenlabs.io/v1/speech-to-text".to_string(),
+            dictation_shortcut: DictationShortcut::default(),
+            dictation_auto_paste: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+struct AppConfig {
+    active_model_id: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            active_model_id: default_model_id(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct TranscriptionResponse {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct GlmTranscriptionResponse {
+    text: String,
+}
+
+struct TranscribeError {
+    message: String,
+}
+
+impl TranscribeError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscribeAudioRequest {
+    bytes: Vec<u8>,
+    file_name: Option<String>,
+    model_id: Option<String>,
+    language: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationTrayUpdate {
+    state: String,
+    queue_len: u32,
+}
+
+
+impl LogStore {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            state: Mutex::new(LogState {
+                next_id: 1,
+                entries: Vec::new(),
+            }),
+            max_entries,
+            log_path: Mutex::new(None),
+        }
+    }
+
+    async fn push(&self, level: &str, message: impl Into<String>) {
+        let timestamp = now_millis();
+        let message = message.into();
+        let mut guard = self.state.lock().await;
+        let entry = LogEntry {
+            id: guard.next_id,
+            timestamp,
+            level: level.to_string(),
+            message: message.clone(),
+        };
+        guard.next_id += 1;
+        guard.entries.insert(0, entry);
+        if guard.entries.len() > self.max_entries {
+            guard.entries.truncate(self.max_entries);
+        }
+        drop(guard);
+
+        let log_path = self.log_path.lock().await.clone();
+        if let Some(path) = log_path {
+            let record = serde_json::json!({
+                "timestamp": timestamp,
+                "level": level,
+                "message": message,
+            });
+            if let Ok(line) = serde_json::to_string(&record) {
+                if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .await
+                {
+                    let _ = file.write_all(line.as_bytes()).await;
+                    let _ = file.write_all(b"\n").await;
+                }
+            }
+        }
+    }
+
+    async fn list(&self) -> Vec<LogEntry> {
+        let guard = self.state.lock().await;
+        guard.entries.clone()
+    }
+
+    async fn clear(&self) {
+        let mut guard = self.state.lock().await;
+        guard.entries.clear();
+        guard.next_id = 1;
+        drop(guard);
+
+        let log_path = self.log_path.lock().await.clone();
+        if let Some(path) = log_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+
+    fn set_log_path(&self, path: PathBuf) {
+        let mut guard = self.log_path.blocking_lock();
+        *guard = Some(path);
+    }
+
+    fn load_from_file(&self, path: &Path) {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut entries = std::collections::VecDeque::new();
+        let mut next_id = 1u64;
+
+        for line in reader.lines().flatten() {
+            let record = serde_json::from_str::<serde_json::Value>(&line).ok();
+            let (timestamp, level, message) = match record {
+                Some(value) => (
+                    value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
+                    value
+                        .get("level")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("info")
+                        .to_string(),
+                    value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                None => continue,
+            };
+            let entry = LogEntry {
+                id: next_id,
+                timestamp,
+                level,
+                message,
+            };
+            next_id += 1;
+            entries.push_back(entry);
+            if entries.len() > self.max_entries {
+                entries.pop_front();
+            }
+        }
+
+        let mut guard = self.state.blocking_lock();
+        guard.entries = entries.into_iter().rev().collect();
+        guard.next_id = next_id;
+    }
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(None)),
+            port: Arc::new(Mutex::new(8787)),
+            started_at: Arc::new(Mutex::new(None)),
+            requests: Arc::new(Mutex::new(0)),
+            logs: Arc::new(LogStore::new(1000)),
+            ui_settings: Arc::new(Mutex::new(UiSettings::default())),
+            settings_path: Arc::new(Mutex::new(None)),
+            models_dir: Arc::new(Mutex::new(None)),
+            config_path: Arc::new(Mutex::new(None)),
+            active_model_id: Arc::new(Mutex::new(default_model_id())),
+            cached_context: Arc::new(Mutex::new(None)),
+            glm_sidecar: Arc::new(Mutex::new(None)),
+            cloud_usage: Arc::new(Mutex::new(CloudUsage::default())),
+            app_handle: Arc::new(Mutex::new(None)),
+            tray_snapshot: Arc::new(Mutex::new(None)),
+            dictation_shortcut: Arc::new(Mutex::new(None)),
+            dictation_tray_state: Arc::new(Mutex::new(DictationTrayState::default())),
+        }
+    }
+}
+
+fn default_model_id() -> String {
+    std::env::var("OPENSTT_DEFAULT_MODEL").unwrap_or_else(|_| "base".to_string())
+}
+
+fn normalize_model_id(model_id: &str) -> String {
+    match model_id {
+        "elevenlabs-scribe-v1" => "elevenlabs-scribe-v2".to_string(),
+        _ => model_id.to_string(),
+    }
+}
+
+fn is_modifier_code(code: Code) -> bool {
+    matches!(
+        code,
+        Code::AltLeft
+            | Code::AltRight
+            | Code::ShiftLeft
+            | Code::ShiftRight
+            | Code::ControlLeft
+            | Code::ControlRight
+            | Code::MetaLeft
+            | Code::MetaRight
+    )
+}
+
+fn parse_dictation_shortcut(shortcut: &DictationShortcut) -> Result<Shortcut, String> {
+    let key_value = if shortcut.key.trim().is_empty() {
+        "AltLeft"
+    } else {
+        shortcut.key.trim()
+    };
+    let key = Code::from_str(key_value)
+        .map_err(|_| format!("Unknown shortcut key: {key_value}"))?;
+    let mut mods = Modifiers::empty();
+    for modifier in &shortcut.modifiers {
+        match modifier.trim().to_lowercase().as_str() {
+            "alt" | "option" => mods |= Modifiers::ALT,
+            "shift" => mods |= Modifiers::SHIFT,
+            "control" | "ctrl" => mods |= Modifiers::CONTROL,
+            "meta" | "command" | "cmd" | "super" => mods |= Modifiers::SUPER,
+            _ => {}
+        }
+    }
+    let mods = if mods.is_empty() || is_modifier_code(key) {
+        None
+    } else {
+        Some(mods)
+    };
+    Ok(Shortcut::new(mods, key))
+}
+
+fn is_modifier_only_shortcut(shortcut: &DictationShortcut) -> bool {
+    let key_value = if shortcut.key.trim().is_empty() {
+        "AltLeft"
+    } else {
+        shortcut.key.trim()
+    };
+    let key = Code::from_str(key_value);
+    shortcut.modifiers.is_empty() && key.map(is_modifier_code).unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn modifier_keycode_and_flag(shortcut: &DictationShortcut) -> Option<(u16, CGEventFlags)> {
+    if !shortcut.modifiers.is_empty() {
+        return None;
+    }
+    let key_value = if shortcut.key.trim().is_empty() {
+        "AltLeft"
+    } else {
+        shortcut.key.trim()
+    };
+    match key_value {
+        "AltLeft" => Some((KeyCode::OPTION, CGEventFlags::CGEventFlagAlternate)),
+        "AltRight" => Some((KeyCode::RIGHT_OPTION, CGEventFlags::CGEventFlagAlternate)),
+        "ShiftLeft" => Some((KeyCode::SHIFT, CGEventFlags::CGEventFlagShift)),
+        "ShiftRight" => Some((KeyCode::RIGHT_SHIFT, CGEventFlags::CGEventFlagShift)),
+        "ControlLeft" => Some((KeyCode::CONTROL, CGEventFlags::CGEventFlagControl)),
+        "ControlRight" => Some((KeyCode::RIGHT_CONTROL, CGEventFlags::CGEventFlagControl)),
+        "MetaLeft" => Some((KeyCode::COMMAND, CGEventFlags::CGEventFlagCommand)),
+        "MetaRight" => Some((KeyCode::RIGHT_COMMAND, CGEventFlags::CGEventFlagCommand)),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
+    thread::spawn(move || {
+        let logs = state.logs.clone();
+        let tap = CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            vec![CGEventType::FlagsChanged],
+            move |_proxy, event_type, event| {
+                if !matches!(event_type, CGEventType::FlagsChanged) {
+                    return Some(event.clone());
+                }
+                let shortcut = state.ui_settings.blocking_lock().dictation_shortcut.clone();
+                let Some((target_key, target_flag)) = modifier_keycode_and_flag(&shortcut) else {
+                    return Some(event.clone());
+                };
+                let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                if keycode != target_key {
+                    return Some(event.clone());
+                }
+                let flags = event.get_flags();
+                let is_down = flags.contains(target_flag);
+                let state_value = if is_down { "pressed" } else { "released" };
+                let _ = app.emit(
+                    "dictation-shortcut",
+                    DictationShortcutEvent {
+                        state: state_value.to_string(),
+                    },
+                );
+                Some(event.clone())
+            },
+        );
+
+        let tap = match tap {
+            Ok(tap) => tap,
+            Err(_) => {
+                tauri::async_runtime::spawn(async move {
+                    logs.push(
+                        "error",
+                        "Failed to start modifier key listener. Enable Input Monitoring for OpenSTT in System Settings.".to_string(),
+                    )
+                    .await;
+                });
+                return;
+            }
+        };
+
+        if let Ok(source) = tap.mach_port.create_runloop_source(0) {
+            let run_loop = CFRunLoop::get_current();
+            unsafe {
+                run_loop.add_source(&source, kCFRunLoopCommonModes);
+            }
+            tap.enable();
+            CFRunLoop::run_current();
+        } else {
+            tauri::async_runtime::spawn(async move {
+                logs.push("error", "Failed to attach modifier key listener.")
+                    .await;
+            });
+        }
+    });
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DictationShortcutEvent {
+    state: String,
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn open_page<R: tauri::Runtime>(app: &tauri::AppHandle<R>, page: &str) {
+    show_main_window(app);
+    let _ = app.emit("open-page", page);
+}
+
+fn format_tray_error(error: Option<String>) -> String {
+    match error {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                "Cloud error: none".to_string()
+            } else if trimmed.len() > 70 {
+                format!("Cloud error: {}...", &trimmed[..67])
+            } else {
+                format!("Cloud error: {trimmed}")
+            }
+        }
+        None => "Cloud error: none".to_string(),
+    }
+}
+
+fn format_tray_provider(provider: Option<String>) -> String {
+    match provider.as_deref() {
+        Some("elevenlabs") => "Cloud provider: ElevenLabs".to_string(),
+        Some("bigmodel") => "Cloud provider: BigModel".to_string(),
+        Some(other) => format!("Cloud provider: {other}"),
+        None => "Cloud provider: n/a".to_string(),
+    }
+}
+
+fn format_dictation_state(state: &str) -> &'static str {
+    match state {
+        "listening" => "Listening",
+        "processing" => "Processing",
+        _ => "Idle",
+    }
+}
+
+fn tray_tooltip(snapshot: &TraySnapshot) -> String {
+    let status = if snapshot.running { "Running" } else { "Stopped" };
+    format!("OpenSTT - {status} - {}", snapshot.model_id)
+}
+
+fn build_tray_menu<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    snapshot: &TraySnapshot,
+) -> Result<Menu<R>, tauri::Error> {
+    let open_item = MenuItem::with_id(app, TRAY_OPEN, "Open OpenSTT", true, None::<String>)?;
+    let start_item = MenuItem::with_id(
+        app,
+        TRAY_START,
+        "Start Gateway",
+        !snapshot.running,
+        None::<String>,
+    )?;
+    let stop_item =
+        MenuItem::with_id(app, TRAY_STOP, "Stop Gateway", snapshot.running, None::<String>)?;
+    let settings_item =
+        MenuItem::with_id(app, TRAY_SETTINGS, "Open Settings", true, None::<String>)?;
+    let logs_item = MenuItem::with_id(app, TRAY_LOGS, "Open Logs", true, None::<String>)?;
+    let model_item = MenuItem::with_id(
+        app,
+        "tray-model",
+        format!("Model: {}", snapshot.model_id),
+        false,
+        None::<String>,
+    )?;
+    let status_item = MenuItem::with_id(
+        app,
+        "tray-status",
+        if snapshot.running {
+            "Gateway: Running"
+        } else {
+            "Gateway: Stopped"
+        },
+        false,
+        None::<String>,
+    )?;
+    let port_item = MenuItem::with_id(
+        app,
+        "tray-port",
+        format!("Port: {}", snapshot.port),
+        false,
+        None::<String>,
+    )?;
+    let cloud_requests_item = MenuItem::with_id(
+        app,
+        "tray-cloud-requests",
+        format!("Cloud requests: {}", snapshot.cloud_requests),
+        false,
+        None::<String>,
+    )?;
+    let cloud_latency_item = MenuItem::with_id(
+        app,
+        "tray-cloud-latency",
+        match snapshot.cloud_latency_ms {
+            Some(value) => format!("Cloud latency: {value} ms"),
+            None => "Cloud latency: n/a".to_string(),
+        },
+        false,
+        None::<String>,
+    )?;
+    let cloud_provider_item = MenuItem::with_id(
+        app,
+        "tray-cloud-provider",
+        format_tray_provider(snapshot.cloud_provider.clone()),
+        false,
+        None::<String>,
+    )?;
+    let cloud_error_item = MenuItem::with_id(
+        app,
+        "tray-cloud-error",
+        format_tray_error(snapshot.cloud_error.clone()),
+        false,
+        None::<String>,
+    )?;
+    let dictation_item = MenuItem::with_id(
+        app,
+        "tray-dictation",
+        format!("Dictation: {}", format_dictation_state(&snapshot.dictation_state)),
+        false,
+        None::<String>,
+    )?;
+    let dictation_queue_item = MenuItem::with_id(
+        app,
+        "tray-dictation-queue",
+        format!("Dictation queue: {}", snapshot.dictation_queue_len),
+        false,
+        None::<String>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, TRAY_QUIT, "Quit OpenSTT", true, None::<String>)?;
+
+    let menu = Menu::new(app)?;
+    menu.append(&open_item)?;
+    menu.append(&settings_item)?;
+    menu.append(&logs_item)?;
+    menu.append(&model_item)?;
+    menu.append(&status_item)?;
+    menu.append(&port_item)?;
+    menu.append(&cloud_requests_item)?;
+    menu.append(&cloud_provider_item)?;
+    menu.append(&cloud_latency_item)?;
+    menu.append(&cloud_error_item)?;
+    menu.append(&dictation_item)?;
+    menu.append(&dictation_queue_item)?;
+    menu.append(&separator)?;
+    menu.append(&start_item)?;
+    menu.append(&stop_item)?;
+    menu.append(&separator)?;
+    menu.append(&quit_item)?;
+    Ok(menu)
+}
+
+async fn tray_snapshot(state: &AppState) -> TraySnapshot {
+    let running = state.runtime.lock().await.is_some();
+    let port = *state.port.lock().await;
+    let model_id = state.active_model_id.lock().await.clone();
+    let cloud = state.cloud_usage.lock().await.clone();
+    let dictation = state.dictation_tray_state.lock().await.clone();
+    TraySnapshot {
+        running,
+        port,
+        model_id,
+        cloud_requests: cloud.requests,
+        cloud_latency_ms: cloud.last_latency_ms,
+        cloud_provider: cloud.last_provider,
+        cloud_error: cloud.last_error,
+        dictation_state: dictation.state,
+        dictation_queue_len: dictation.queue_len,
+    }
+}
+
+async fn refresh_tray(state: &AppState) {
+    let app_handle = state.app_handle.lock().await.clone();
+    let Some(app_handle) = app_handle else {
+        return;
+    };
+    let snapshot = tray_snapshot(state).await;
+    {
+        let mut last_snapshot = state.tray_snapshot.lock().await;
+        if last_snapshot.as_ref() == Some(&snapshot) {
+            return;
+        }
+        *last_snapshot = Some(snapshot.clone());
+    }
+    let menu = match build_tray_menu(&app_handle, &snapshot) {
+        Ok(menu) => menu,
+        Err(_) => return,
+    };
+    if let Some(tray) = app_handle.tray_by_id(TRAY_ID) {
+        let _ = tray.set_menu(Some(menu));
+        let _ = tray.set_tooltip(Some(tray_tooltip(&snapshot)));
+    }
+}
+
+async fn register_dictation_shortcut(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    shortcut: &DictationShortcut,
+) -> Result<(), String> {
+    let mut current = state.dictation_shortcut.lock().await;
+    if is_modifier_only_shortcut(shortcut) {
+        if let Some(existing) = current.take() {
+            let _ = app.global_shortcut().unregister(existing);
+        }
+        return Ok(());
+    }
+    let parsed = parse_dictation_shortcut(shortcut)?;
+    if current.as_ref().map(|item| item.id()) == Some(parsed.id()) {
+        return Ok(());
+    }
+    if let Some(existing) = current.take() {
+        let _ = app.global_shortcut().unregister(existing);
+    }
+    app.global_shortcut()
+        .register(parsed)
+        .map_err(|err| format!("Failed to register shortcut: {err}"))?;
+    *current = Some(parsed);
+    Ok(())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn openstt_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    home.join(".openstt")
+}
+
+fn settings_path() -> PathBuf {
+    openstt_dir().join("settings.json")
+}
+
+fn config_path() -> PathBuf {
+    openstt_dir().join("state.json")
+}
+
+fn models_dir() -> PathBuf {
+    openstt_dir().join("models")
+}
+
+fn logs_path() -> PathBuf {
+    openstt_dir().join("logs").join("openstt.log")
+}
+
+fn glm_cache_dir() -> PathBuf {
+    models_dir().join("glm").join("cache")
+}
+
+fn glm_sidecar_script() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENSTT_GLM_SIDECAR") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("sidecar")
+        .join("glm_mlx.py")
+}
+
+fn python_command() -> String {
+    if let Ok(path) = std::env::var("OPENSTT_PYTHON") {
+        return path;
+    }
+    let venv_python = venv_python_path();
+    if venv_python.exists() {
+        return venv_python.to_string_lossy().to_string();
+    }
+    "python3".to_string()
+}
+
+fn base_python_command() -> String {
+    if let Ok(path) = std::env::var("OPENSTT_PYTHON") {
+        if Path::new(&path).exists() {
+            return path;
+        }
+    }
+    "python3".to_string()
+}
+
+fn venv_dir() -> PathBuf {
+    openstt_dir().join("venv")
+}
+
+fn venv_python_path() -> PathBuf {
+    venv_dir().join("bin").join("python3")
+}
+
+fn glm_supported() -> bool {
+    matches!(std::env::consts::ARCH, "aarch64" | "arm64")
+        && std::env::consts::OS == "macos"
+}
+
+fn parse_cloud_provider(value: &str) -> Option<models::CloudProvider> {
+    match value.trim().to_lowercase().as_str() {
+        "bigmodel" | "zhipu" => Some(models::CloudProvider::BigModel),
+        "elevenlabs" | "eleven" => Some(models::CloudProvider::ElevenLabs),
+        _ => None,
+    }
+}
+
+fn default_cloud_endpoint(provider: models::CloudProvider) -> &'static str {
+    match provider {
+        models::CloudProvider::BigModel => {
+            "https://open.bigmodel.cn/api/paas/v4/audio/transcriptions"
+        }
+        models::CloudProvider::ElevenLabs => "https://api.elevenlabs.io/v1/speech-to-text",
+    }
+}
+
+fn default_cloud_model(provider: models::CloudProvider) -> &'static str {
+    match provider {
+        models::CloudProvider::BigModel => "glm-asr-2512",
+        models::CloudProvider::ElevenLabs => "scribe_v2",
+    }
+}
+
+fn build_silence_wav(sample_rate: u32, duration_ms: u32) -> Vec<u8> {
+    let channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let bytes_per_sample = bits_per_sample / 8;
+    let num_samples = sample_rate.saturating_mul(duration_ms) / 1000;
+    let data_size = num_samples as u32 * channels as u32 * bytes_per_sample as u32;
+    let mut buffer = Vec::with_capacity(44 + data_size as usize);
+
+    buffer.extend_from_slice(b"RIFF");
+    buffer.extend_from_slice(&(36 + data_size).to_le_bytes());
+    buffer.extend_from_slice(b"WAVE");
+    buffer.extend_from_slice(b"fmt ");
+    buffer.extend_from_slice(&16u32.to_le_bytes());
+    buffer.extend_from_slice(&1u16.to_le_bytes());
+    buffer.extend_from_slice(&channels.to_le_bytes());
+    buffer.extend_from_slice(&sample_rate.to_le_bytes());
+    let byte_rate = sample_rate * channels as u32 * bytes_per_sample as u32;
+    buffer.extend_from_slice(&byte_rate.to_le_bytes());
+    let block_align = channels * bytes_per_sample;
+    buffer.extend_from_slice(&block_align.to_le_bytes());
+    buffer.extend_from_slice(&bits_per_sample.to_le_bytes());
+    buffer.extend_from_slice(b"data");
+    buffer.extend_from_slice(&data_size.to_le_bytes());
+
+    buffer.resize(44 + data_size as usize, 0);
+    buffer
+}
+
+async fn run_python_check(python: &str, args: &[&str]) -> bool {
+    Command::new(python)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+async fn glm_dependency_status_inner() -> GlmDependencyStatus {
+    if !glm_supported() {
+        return GlmDependencyStatus {
+            supported: false,
+            ready: false,
+            python: None,
+            venv: venv_python_path().exists(),
+            mlx_audio: false,
+            message: Some("MLX runtime requires Apple Silicon".to_string()),
+        };
+    }
+
+    let python = python_command();
+    let python_ok = run_python_check(&python, &["-c", "import sys"])
+        .await;
+    let mlx_audio = if python_ok {
+        run_python_check(&python, &["-c", "import mlx_audio"]).await
+    } else {
+        false
+    };
+
+    GlmDependencyStatus {
+        supported: true,
+        ready: python_ok && mlx_audio,
+        python: python_ok.then(|| python),
+        venv: venv_python_path().exists(),
+        mlx_audio,
+        message: if python_ok {
+            None
+        } else {
+            Some("Python not available".to_string())
+        },
+    }
+}
+
+#[tauri::command]
+async fn glm_dependency_status() -> Result<GlmDependencyStatus, String> {
+    Ok(glm_dependency_status_inner().await)
+}
+
+#[tauri::command]
+async fn glm_install_dependencies(state: TauriState<'_, AppState>) -> Result<GlmDependencyStatus, String> {
+    if !glm_supported() {
+        return Err("MLX runtime requires Apple Silicon".to_string());
+    }
+    let base_python = base_python_command();
+    let venv = venv_dir();
+    if !venv.exists() {
+        let status = Command::new(&base_python)
+            .arg("-m")
+            .arg("venv")
+            .arg(&venv)
+            .status()
+            .await
+            .map_err(|err| format!("Failed to create venv: {err}"))?;
+        if !status.success() {
+            return Err("Failed to create venv".to_string());
+        }
+    }
+
+    let venv_python = venv_python_path();
+    let status = Command::new(&venv_python)
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("-U")
+        .arg("pip")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .status()
+        .await
+        .map_err(|err| format!("Failed to update pip: {err}"))?;
+    if !status.success() {
+        return Err("Failed to update pip".to_string());
+    }
+
+    state
+        .logs
+        .push("info", "Installing MLX runtime (mlx-audio)")
+        .await;
+
+    let status = Command::new(&venv_python)
+        .arg("-m")
+        .arg("pip")
+        .arg("install")
+        .arg("-U")
+        .arg("mlx-audio")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .status()
+        .await
+        .map_err(|err| format!("Failed to install mlx-audio: {err}"))?;
+    if !status.success() {
+        return Err("Failed to install mlx-audio".to_string());
+    }
+
+    Ok(glm_dependency_status_inner().await)
+}
+
+#[tauri::command]
+async fn glm_clear_cache(state: TauriState<'_, AppState>) -> Result<(), String> {
+    if let Some(mut sidecar) = state.glm_sidecar.lock().await.take() {
+        let _ = sidecar.child.kill().await;
+    }
+    let cache_dir = glm_cache_dir();
+    if cache_dir.exists() {
+        tokio::fs::remove_dir_all(&cache_dir)
+            .await
+            .map_err(|err| format!("Failed to clear cache: {err}"))?;
+        let _ = tokio::fs::create_dir_all(&cache_dir).await;
+    }
+
+    let glm_dir = models_dir().join("glm");
+    if let Ok(mut entries) = tokio::fs::read_dir(&glm_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("ready") {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+    }
+
+    state.logs.push("info", "GLM cache cleared").await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn glm_reset_runtime(state: TauriState<'_, AppState>) -> Result<(), String> {
+    if let Some(mut sidecar) = state.glm_sidecar.lock().await.take() {
+        let _ = sidecar.child.kill().await;
+    }
+    let venv = venv_dir();
+    if venv.exists() {
+        tokio::fs::remove_dir_all(&venv)
+            .await
+            .map_err(|err| format!("Failed to remove venv: {err}"))?;
+    }
+    state.logs.push("info", "GLM runtime reset").await;
+    Ok(())
+}
+
+fn load_ui_settings(path: &Path) -> UiSettings {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        if let Ok(settings) = serde_json::from_str::<UiSettings>(&contents) {
+            return settings;
+        }
+    }
+    UiSettings::default()
+}
+
+fn save_ui_settings(path: &Path, settings: &UiSettings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create settings directory: {err}"))?;
+    }
+    let payload = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("Failed to serialize settings: {err}"))?;
+    std::fs::write(path, payload).map_err(|err| format!("Failed to save settings: {err}"))
+}
+
+fn load_app_config(path: &Path) -> AppConfig {
+    if let Ok(contents) = std::fs::read_to_string(path) {
+        if let Ok(config) = serde_json::from_str::<AppConfig>(&contents) {
+            return config;
+        }
+    }
+    AppConfig::default()
+}
+
+fn save_app_config(path: &Path, config: &AppConfig) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create config directory: {err}"))?;
+    }
+    let payload = serde_json::to_string_pretty(config)
+        .map_err(|err| format!("Failed to serialize config: {err}"))?;
+    std::fs::write(path, payload).map_err(|err| format!("Failed to save config: {err}"))
+}
+
+async fn prepare_glm_model(
+    state: &AppState,
+    models_root: &Path,
+    entry: models::CatalogEntry,
+) -> Result<(), String> {
+    let deps = glm_dependency_status_inner().await;
+    if !deps.ready {
+        return Err(deps
+            .message
+            .unwrap_or_else(|| "MLX runtime not installed".to_string()));
+    }
+    let marker = models::model_path(models_root, entry.id)
+        .ok_or_else(|| format!("Unknown model: {}", entry.id))?;
+    if marker.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create model directory: {err}"))?;
+    }
+    let script = glm_sidecar_script();
+    if !script.exists() {
+        return Err("GLM sidecar script not found".to_string());
+    }
+
+    state
+        .logs
+        .push("info", format!("Preparing model {}...", entry.id))
+        .await;
+
+    let output = Command::new(python_command())
+        .arg(script)
+        .arg("--model")
+        .arg(entry.download_url)
+        .arg("--preload")
+        .env("HF_HOME", glm_cache_dir())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|err| format!("Failed to run GLM preload: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("GLM preload failed: {stderr}"));
+    }
+
+    tokio::fs::write(&marker, b"ready")
+        .await
+        .map_err(|err| format!("Failed to write model marker: {err}"))?;
+
+    state
+        .logs
+        .push("info", format!("Model {} ready", entry.id))
+        .await;
+    Ok(())
+}
+
+async fn glm_health(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build();
+    if let Ok(client) = client {
+        return client
+            .get(url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+    }
+    false
+}
+
+async fn ensure_glm_sidecar(state: &AppState, model_id: &str) -> Result<u16, String> {
+    let existing = {
+        let guard = state.glm_sidecar.lock().await;
+        guard.as_ref().map(|sidecar| (sidecar.model_id.clone(), sidecar.port))
+    };
+
+    if let Some((existing_model, existing_port)) = existing {
+        if existing_model == model_id && glm_health(existing_port).await {
+            return Ok(existing_port);
+        }
+    }
+
+    if let Some(mut old) = state.glm_sidecar.lock().await.take() {
+        let _ = old.child.kill().await;
+    }
+
+    let port = std::env::var("OPENSTT_GLM_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8791);
+    let script = glm_sidecar_script();
+    if !script.exists() {
+        return Err("GLM sidecar script not found".to_string());
+    }
+
+    let child = Command::new(python_command())
+        .arg(script)
+        .arg("--model")
+        .arg(model_id)
+        .arg("--port")
+        .arg(port.to_string())
+        .env("HF_HOME", glm_cache_dir())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Failed to start GLM sidecar: {err}"))?;
+
+    let mut attempts = 0;
+    while attempts < 20 {
+        if glm_health(port).await {
+            let mut guard = state.glm_sidecar.lock().await;
+            *guard = Some(GlmSidecar {
+                model_id: model_id.to_string(),
+                port,
+                child,
+            });
+            return Ok(port);
+        }
+        attempts += 1;
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    let stderr = child
+        .wait_with_output()
+        .await
+        .map(|output| String::from_utf8_lossy(&output.stderr).to_string())
+        .unwrap_or_else(|_| "".to_string());
+    Err(format!("GLM sidecar failed to start. {stderr}"))
+}
+
+async fn glm_transcribe(
+    state: &AppState,
+    model_id: &str,
+    audio_path: &Path,
+) -> Result<String, String> {
+    let port = ensure_glm_sidecar(state, model_id).await?;
+    let url = format!("http://127.0.0.1:{port}/transcribe");
+    let payload = serde_json::json!({
+        "audio_path": audio_path.to_string_lossy().to_string()
+    });
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("GLM sidecar request failed: {err}"))?;
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("GLM sidecar error: {body}"));
+    }
+    let payload = response
+        .json::<GlmTranscriptionResponse>()
+        .await
+        .map_err(|err| format!("GLM response parse failed: {err}"))?;
+    Ok(payload.text)
+}
+
+async fn update_cloud_usage(
+    state: &AppState,
+    provider: models::CloudProvider,
+    latency_ms: u64,
+    error: Option<String>,
+) {
+    let mut usage = state.cloud_usage.lock().await;
+    usage.requests += 1;
+    usage.last_latency_ms = Some(latency_ms);
+    usage.last_provider = Some(provider.as_str().to_string());
+    usage.last_error = error;
+    drop(usage);
+    refresh_tray(state).await;
+}
+
+async fn cloud_request(
+    provider: models::CloudProvider,
+    api_key: &str,
+    endpoint: &str,
+    model_name: &str,
+    file_name: Option<String>,
+    file_bytes: Vec<u8>,
+    prompt: Option<String>,
+) -> Result<String, String> {
+    let filename = file_name.unwrap_or_else(|| "audio.wav".to_string());
+    let part = reqwest::multipart::Part::bytes(file_bytes)
+        .file_name(filename)
+        .mime_str("application/octet-stream")
+        .map_err(|err| format!("Failed to build file part: {err}"))?;
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    match provider {
+        models::CloudProvider::BigModel => {
+            form = form.text("model", model_name.to_string()).text("stream", "false");
+            if let Some(prompt) = prompt {
+                if !prompt.trim().is_empty() {
+                    form = form.text("prompt", prompt);
+                }
+            }
+        }
+        models::CloudProvider::ElevenLabs => {
+            form = form.text("model_id", model_name.to_string());
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let mut request = client.post(endpoint).multipart(form);
+    match provider {
+        models::CloudProvider::BigModel => {
+            request = request.bearer_auth(api_key);
+        }
+        models::CloudProvider::ElevenLabs => {
+            request = request.header("xi-api-key", api_key);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("Cloud request failed: {err}"))?;
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .unwrap_or(body);
+        return Err(format!("Cloud error: {message}"));
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|err| format!("Cloud response parse failed: {err}"))?;
+    if let Some(text) = payload.get("text").and_then(|value| value.as_str()) {
+        return Ok(text.to_string());
+    }
+    if let Some(transcripts) = payload.get("transcripts").and_then(|value| value.as_array()) {
+        let text = transcripts
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            return Ok(text);
+        }
+    }
+    Err("Cloud response missing text".to_string())
+}
+
+async fn cloud_transcribe(
+    state: &AppState,
+    provider: models::CloudProvider,
+    model_name: &str,
+    file_name: Option<String>,
+    file_bytes: Vec<u8>,
+    prompt: Option<String>,
+    track_usage: bool,
+) -> Result<String, String> {
+    let settings = state.ui_settings.lock().await.clone();
+    let (api_key, endpoint) = match provider {
+        models::CloudProvider::BigModel => (
+            settings.bigmodel_api_key.trim().to_string(),
+            if settings.bigmodel_api_endpoint.trim().is_empty() {
+                default_cloud_endpoint(provider).to_string()
+            } else {
+                settings.bigmodel_api_endpoint.trim().to_string()
+            },
+        ),
+        models::CloudProvider::ElevenLabs => (
+            settings.elevenlabs_api_key.trim().to_string(),
+            if settings.elevenlabs_api_endpoint.trim().is_empty() {
+                default_cloud_endpoint(provider).to_string()
+            } else {
+                settings.elevenlabs_api_endpoint.trim().to_string()
+            },
+        ),
+    };
+    if api_key.is_empty() {
+        return Err("Cloud API key is not set".to_string());
+    }
+
+    let start = Instant::now();
+    let result = cloud_request(
+        provider,
+        &api_key,
+        &endpoint,
+        model_name,
+        file_name,
+        file_bytes,
+        prompt,
+    )
+    .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    if track_usage {
+        update_cloud_usage(
+            state,
+            provider,
+            latency_ms,
+            result.as_ref().err().cloned(),
+        )
+        .await;
+    }
+    result
+}
+
+async fn transcribe_bytes(
+    state: &AppState,
+    model: Option<String>,
+    file_name: Option<String>,
+    file_bytes: Vec<u8>,
+    language: Option<String>,
+    task: Option<String>,
+    temperature: Option<f32>,
+    prompt: Option<String>,
+) -> Result<String, TranscribeError> {
+    if file_bytes.is_empty() {
+        return Err(TranscribeError::bad_request("Empty audio payload"));
+    }
+
+    {
+        let mut count = state.requests.lock().await;
+        *count += 1;
+    }
+
+    let selected_model = if let Some(model_id) = model {
+        model_id
+    } else {
+        state.active_model_id.lock().await.clone()
+    };
+    let model_id = normalize_model_id(&selected_model);
+    let entry = match models::model_entry(&model_id) {
+        Some(entry) => entry,
+        None => {
+            let message = format!("Unknown model: {model_id}");
+            state.logs.push("error", message.clone()).await;
+            return Err(TranscribeError::bad_request(message));
+        }
+    };
+    let file_label = file_name.clone().unwrap_or_else(|| "unknown".to_string());
+    let size_label = file_bytes.len().to_string();
+    state
+        .logs
+        .push(
+            "info",
+            format!(
+                "Transcription request model={model_id} file={file_label} bytes={size_label}"
+            ),
+        )
+        .await;
+
+    if entry.engine == models::ModelEngine::Cloud {
+        let model_name = models::cloud_model_name(&model_id)
+            .unwrap_or("glm-asr-2512");
+        let provider = models::cloud_provider(&model_id)
+            .unwrap_or(models::CloudProvider::BigModel);
+        let text = match cloud_transcribe(
+            state,
+            provider,
+            model_name,
+            file_name.clone(),
+            file_bytes,
+            prompt.clone(),
+            true,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return Err(TranscribeError::bad_request(err));
+            }
+        };
+        return Ok(text);
+    }
+
+    let extension = file_name
+        .as_ref()
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let temp_path = std::env::temp_dir()
+        .join(format!("openstt-upload-{}.{}", now_millis(), extension));
+    if let Err(err) = tokio::fs::write(&temp_path, &file_bytes).await {
+        let message = format!("Failed to write temp file: {err}");
+        state.logs.push("error", message.clone()).await;
+        return Err(TranscribeError::internal(message));
+    }
+
+    if entry.engine == models::ModelEngine::GlmMlx {
+        let dir = match resolve_models_dir(state).await {
+            Ok(dir) => dir,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return Err(TranscribeError::internal(err));
+            }
+        };
+        let marker = models::model_path(&dir, &model_id)
+            .ok_or_else(|| format!("Unknown model: {model_id}"));
+        let marker = match marker {
+            Ok(path) => path,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return Err(TranscribeError::bad_request(err));
+            }
+        };
+        if !marker.exists() {
+            if std::env::var("OPENSTT_AUTO_DOWNLOAD").ok().as_deref() == Some("1") {
+                if let Err(err) = download_model_inner(state, &model_id).await {
+                    state.logs.push("error", err.clone()).await;
+                    return Err(TranscribeError::bad_request(err));
+                }
+            } else {
+                let err = format!("Model {model_id} not prepared");
+                state.logs.push("error", err.clone()).await;
+                return Err(TranscribeError::bad_request(err));
+            }
+        }
+
+        let text = match glm_transcribe(state, entry.download_url, &temp_path).await {
+            Ok(text) => text,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return Err(TranscribeError::internal(err));
+            }
+        };
+
+        let _ = std::fs::remove_file(&temp_path);
+        return Ok(text);
+    }
+
+    let model_path = match ensure_whisper_model_path(state, &model_id).await {
+        Ok(path) => path,
+        Err(err) => {
+            state.logs.push("error", err.clone()).await;
+            return Err(TranscribeError::bad_request(err));
+        }
+    };
+
+    let cached_context = {
+        let cached = state.cached_context.lock().await.clone();
+        cached
+            .filter(|entry| entry.model_id == model_id)
+            .map(|entry| entry.context)
+    };
+    let language_value = language.clone();
+    let prompt_value = prompt.clone();
+    let translate = task.as_deref() == Some("translate");
+    let temperature_value = temperature.unwrap_or(0.0);
+    let model_path_value = model_path.clone();
+    let temp_path_value = temp_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let audio = audio::load_and_resample(&temp_path_value)?;
+        let mut new_context: Option<Arc<WhisperContext>> = None;
+        let context = if let Some(context) = cached_context {
+            context
+        } else {
+            let context = WhisperContext::new_with_params(
+                model_path_value
+                    .to_str()
+                    .ok_or_else(|| "Invalid model path".to_string())?,
+                WhisperContextParameters::default(),
+            )
+            .map_err(|err| format!("Failed to load model: {err:?}"))?;
+            let context = Arc::new(context);
+            new_context = Some(Arc::clone(&context));
+            context
+        };
+
+        let params = build_whisper_params(
+            language_value.as_deref(),
+            prompt_value.as_deref(),
+            translate,
+            temperature_value,
+        );
+        let mut state = context
+            .create_state()
+            .map_err(|err| format!("Failed to create whisper state: {err:?}"))?;
+        state
+            .full(params, &audio)
+            .map_err(|err| format!("Transcription failed: {err:?}"))?;
+        let segments = state
+            .full_n_segments()
+            .map_err(|err| format!("Failed to read segments: {err:?}"))?;
+        let mut text = String::new();
+        for index in 0..segments {
+            let segment = state
+                .full_get_segment_text(index)
+                .map_err(|err| format!("Failed to read segment text: {err:?}"))?;
+            text.push_str(&segment);
+        }
+        Ok::<(String, Option<Arc<WhisperContext>>), String>(
+            (text.trim().to_string(), new_context),
+        )
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let (text, new_context) = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            state.logs.push("error", err.clone()).await;
+            return Err(TranscribeError::internal(err));
+        }
+        Err(err) => {
+            let message = format!("Transcription task failed: {err}");
+            state.logs.push("error", message.clone()).await;
+            return Err(TranscribeError::internal(message));
+        }
+    };
+
+    if let Some(context) = new_context {
+        let mut cached = state.cached_context.lock().await;
+        *cached = Some(CachedWhisperContext {
+            model_id: model_id.clone(),
+            context,
+        });
+    }
+
+    Ok(text)
+}
+
+async fn resolve_models_dir(state: &AppState) -> Result<PathBuf, String> {
+    state
+        .models_dir
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Models directory not initialized".to_string())
+}
+
+fn hf_cache_dir_for(model_id: &str) -> PathBuf {
+    let folder = model_id.replace('/', "--");
+    glm_cache_dir().join("hub").join(format!("models--{folder}"))
+}
+
+async fn build_status(state: &AppState) -> ServerStatus {
+    let running = state.runtime.lock().await.is_some();
+    let port = *state.port.lock().await;
+    let started_at = *state.started_at.lock().await;
+    let requests = *state.requests.lock().await;
+    let url = if running {
+        Some(format!("http://127.0.0.1:{port}"))
+    } else {
+        None
+    };
+    ServerStatus {
+        running,
+        port,
+        url,
+        started_at,
+        requests,
+    }
+}
+
+async fn start_server_inner(app_state: AppState, port: u16) -> Result<ServerStatus, String> {
+    if port == 0 {
+        return Err("Port must be between 1 and 65535".to_string());
+    }
+
+    if app_state.runtime.lock().await.is_some() {
+        return Ok(build_status(&app_state).await);
+    }
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|err| format!("Failed to bind {addr}: {err}"))?;
+
+    *app_state.port.lock().await = port;
+    *app_state.started_at.lock().await = Some(now_millis());
+    *app_state.requests.lock().await = 0;
+    app_state
+        .logs
+        .push("info", format!("Gateway starting on http://127.0.0.1:{port}"))
+        .await;
+
+    let router = Router::new()
+        .route("/health", get(health))
+        .route("/v1/audio/transcriptions", post(transcribe))
+        .with_state(app_state.clone());
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_state = app_state.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let result = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        if let Err(err) = result {
+            server_state
+                .logs
+                .push("error", format!("Gateway error: {err}"))
+                .await;
+        }
+    });
+
+    let runtime = ServerRuntime {
+        shutdown: shutdown_tx,
+        handle,
+    };
+    *app_state.runtime.lock().await = Some(runtime);
+
+    refresh_tray(&app_state).await;
+
+    Ok(build_status(&app_state).await)
+}
+
+async fn stop_server_inner(app_state: AppState) -> Result<ServerStatus, String> {
+    let runtime = { app_state.runtime.lock().await.take() };
+
+    if let Some(runtime) = runtime {
+        let _ = runtime.shutdown.send(());
+        let _ = runtime.handle.await;
+        app_state.logs.push("info", "Gateway stopped").await;
+    }
+
+    *app_state.started_at.lock().await = None;
+    refresh_tray(&app_state).await;
+    Ok(build_status(&app_state).await)
+}
+
+#[tauri::command]
+async fn start_server(
+    state: TauriState<'_, AppState>,
+    port: u16,
+) -> Result<ServerStatus, String> {
+    start_server_inner((*state).clone(), port).await
+}
+
+#[tauri::command]
+async fn stop_server(state: TauriState<'_, AppState>) -> Result<ServerStatus, String> {
+    stop_server_inner((*state).clone()).await
+}
+
+#[tauri::command]
+async fn get_server_status(state: TauriState<'_, AppState>) -> Result<ServerStatus, String> {
+    Ok(build_status(&(*state).clone()).await)
+}
+
+#[tauri::command]
+async fn get_logs(state: TauriState<'_, AppState>) -> Result<Vec<LogEntry>, String> {
+    Ok(state.logs.list().await)
+}
+
+#[tauri::command]
+async fn clear_logs(state: TauriState<'_, AppState>) -> Result<(), String> {
+    state.logs.clear().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_ui_settings(state: TauriState<'_, AppState>) -> Result<UiSettings, String> {
+    Ok(state.ui_settings.lock().await.clone())
+}
+
+#[tauri::command]
+async fn set_ui_settings(
+    state: TauriState<'_, AppState>,
+    settings: UiSettings,
+) -> Result<UiSettings, String> {
+    *state.ui_settings.lock().await = settings.clone();
+    if let Some(path) = state.settings_path.lock().await.clone() {
+        save_ui_settings(&path, &settings)?;
+    }
+    if let Some(app_handle) = state.app_handle.lock().await.clone() {
+        if let Err(err) = register_dictation_shortcut(&app_handle, &state, &settings.dictation_shortcut).await {
+            state
+                .logs
+                .push("error", format!("Failed to update dictation shortcut: {err}"))
+                .await;
+        }
+    }
+    Ok(settings)
+}
+
+#[tauri::command]
+async fn transcribe_audio(
+    state: TauriState<'_, AppState>,
+    request: TranscribeAudioRequest,
+) -> Result<String, String> {
+    let result = transcribe_bytes(
+        &state,
+        request.model_id,
+        request.file_name,
+        request.bytes,
+        request.language,
+        None,
+        None,
+        None,
+    )
+    .await;
+    match result {
+        Ok(text) => Ok(text),
+        Err(err) => Err(err.message),
+    }
+}
+
+#[tauri::command]
+async fn paste_clipboard() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"System Events\" to keystroke \"v\" using command down")
+            .status()
+            .await
+            .map_err(|err| format!("Failed to run paste helper: {err}"))?;
+        if !status.success() {
+            return Err("Paste command failed".to_string());
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Auto paste is only supported on macOS".to_string())
+    }
+}
+
+#[tauri::command]
+async fn set_dictation_tray_state(
+    state: TauriState<'_, AppState>,
+    update: DictationTrayUpdate,
+) -> Result<(), String> {
+    {
+        let mut dictation = state.dictation_tray_state.lock().await;
+        dictation.state = update.state;
+        dictation.queue_len = update.queue_len;
+    }
+    refresh_tray(&state).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_cloud_usage(state: TauriState<'_, AppState>) -> Result<CloudUsage, String> {
+    Ok(state.cloud_usage.lock().await.clone())
+}
+
+#[tauri::command]
+async fn test_cloud_api_key(
+    provider: String,
+    api_key: String,
+    endpoint: String,
+) -> Result<CloudTestResult, String> {
+    let provider =
+        parse_cloud_provider(&provider).ok_or_else(|| "Unknown provider".to_string())?;
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err("API key is required".to_string());
+    }
+    let endpoint = if endpoint.trim().is_empty() {
+        default_cloud_endpoint(provider).to_string()
+    } else {
+        endpoint.trim().to_string()
+    };
+    let model_name = default_cloud_model(provider);
+    let audio = build_silence_wav(16_000, 800);
+    let start = Instant::now();
+    let result = cloud_request(
+        provider,
+        api_key,
+        &endpoint,
+        model_name,
+        Some("test.wav".to_string()),
+        audio,
+        None,
+    )
+    .await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    let (ok, message) = match result {
+        Ok(_) => (true, String::new()),
+        Err(err) => (false, err),
+    };
+    Ok(CloudTestResult {
+        ok,
+        latency_ms: Some(latency_ms),
+        message,
+    })
+}
+
+#[tauri::command]
+async fn list_models(state: TauriState<'_, AppState>) -> Result<Vec<models::ModelInfo>, String> {
+    let dir = resolve_models_dir(&*state).await?;
+    Ok(models::list_models(&dir))
+}
+
+#[tauri::command]
+async fn download_model(
+    state: TauriState<'_, AppState>,
+    model_id: String,
+) -> Result<models::ModelInfo, String> {
+    download_model_inner(&*state, &model_id).await
+}
+
+#[tauri::command]
+async fn delete_model(state: TauriState<'_, AppState>, model_id: String) -> Result<(), String> {
+    let active_model = state.active_model_id.lock().await.clone();
+    if active_model == model_id {
+        return Err("Cannot delete the active model".to_string());
+    }
+    let dir = resolve_models_dir(&*state).await?;
+    let entry = models::model_entry(&model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    if entry.engine == models::ModelEngine::Cloud {
+        return Err("Cloud models have no local files".to_string());
+    }
+    let path = models::model_path(&dir, &model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    if entry.engine == models::ModelEngine::GlmMlx {
+        if path.exists() {
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|err| format!("Failed to delete model marker: {err}"))?;
+        }
+        let cache_dir = hf_cache_dir_for(entry.download_url);
+        if cache_dir.exists() {
+            tokio::fs::remove_dir_all(&cache_dir)
+                .await
+                .map_err(|err| format!("Failed to delete model cache: {err}"))?;
+        }
+    } else {
+        if !path.exists() {
+            return Err("Model file not found".to_string());
+        }
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|err| format!("Failed to delete model: {err}"))?;
+    }
+    state
+        .logs
+        .push("info", format!("Model {model_id} deleted"))
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_active_model(state: TauriState<'_, AppState>) -> Result<String, String> {
+    Ok(state.active_model_id.lock().await.clone())
+}
+
+#[tauri::command]
+async fn set_active_model(
+    state: TauriState<'_, AppState>,
+    model_id: String,
+) -> Result<String, String> {
+    let model_id = normalize_model_id(&model_id);
+    if models::model_entry(&model_id).is_none() {
+        return Err(format!("Unknown model: {model_id}"));
+    }
+    *state.active_model_id.lock().await = model_id.clone();
+    *state.cached_context.lock().await = None;
+    if let Some(path) = state.config_path.lock().await.clone() {
+        let config = AppConfig {
+            active_model_id: model_id.clone(),
+        };
+        save_app_config(&path, &config)?;
+    }
+    state
+        .logs
+        .push("info", format!("Active model set to {model_id}"))
+        .await;
+    refresh_tray(&state).await;
+    Ok(model_id)
+}
+
+async fn download_model_inner(
+    state: &AppState,
+    model_id: &str,
+) -> Result<models::ModelInfo, String> {
+    let dir = resolve_models_dir(state).await?;
+    let entry = models::model_entry(model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    if entry.engine == models::ModelEngine::Cloud {
+        let models = models::list_models(&dir);
+        return models
+            .into_iter()
+            .find(|info| info.id == model_id)
+            .ok_or_else(|| "Model info unavailable".to_string());
+    }
+    if entry.engine == models::ModelEngine::GlmMlx {
+        prepare_glm_model(state, &dir, entry).await?;
+        let models = models::list_models(&dir);
+        return models
+            .into_iter()
+            .find(|info| info.id == model_id)
+            .ok_or_else(|| "Model info unavailable".to_string());
+    }
+
+    let path = models::model_path(&dir, model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+
+    if path.exists() {
+        let models = models::list_models(&dir);
+        return models
+            .into_iter()
+            .find(|info| info.id == model_id)
+            .ok_or_else(|| "Model info unavailable".to_string());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create model directory: {err}"))?;
+    }
+    state
+        .logs
+        .push("info", format!("Downloading model {model_id}..."))
+        .await;
+
+    let response = reqwest::get(entry.download_url)
+        .await
+        .map_err(|err| format!("Failed to start download: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Download failed with status {}",
+            response.status()
+        ));
+    }
+
+    let total = response.content_length().unwrap_or(0);
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|err| format!("Failed to create model file: {err}"))?;
+    let mut stream = response.bytes_stream();
+    let mut downloaded: u64 = 0;
+    let mut next_log_at = 50 * 1024 * 1024;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("Download error: {err}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| format!("Failed to write model file: {err}"))?;
+        downloaded += chunk.len() as u64;
+        if total > 0 && downloaded >= next_log_at {
+            let percent = (downloaded as f64 / total as f64 * 100.0).round();
+            state
+                .logs
+                .push(
+                    "info",
+                    format!("Downloading {model_id}: {percent}%"),
+                )
+                .await;
+            next_log_at += 50 * 1024 * 1024;
+        }
+    }
+
+    file.flush()
+        .await
+        .map_err(|err| format!("Failed to finalize model file: {err}"))?;
+    state
+        .logs
+        .push("info", format!("Model {model_id} downloaded"))
+        .await;
+
+    let models = models::list_models(&dir);
+    models
+        .into_iter()
+        .find(|info| info.id == model_id)
+        .ok_or_else(|| "Model info unavailable".to_string())
+}
+
+async fn ensure_whisper_model_path(state: &AppState, model_id: &str) -> Result<PathBuf, String> {
+    let entry = models::model_entry(model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    if entry.engine != models::ModelEngine::Whisper {
+        return Err(format!("Model {model_id} is not a Whisper model"));
+    }
+    let dir = resolve_models_dir(state).await?;
+    let path = models::model_path(&dir, model_id)
+        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    if path.exists() {
+        return Ok(path);
+    }
+    if std::env::var("OPENSTT_AUTO_DOWNLOAD").ok().as_deref() == Some("1") {
+        let _ = download_model_inner(state, model_id).await?;
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!("Model {model_id} not downloaded"))
+}
+
+fn build_whisper_params<'a>(
+    language: Option<&'a str>,
+    prompt: Option<&'a str>,
+    translate: bool,
+    temperature: f32,
+) -> FullParams<'a, 'a> {
+    let strategy = if temperature == 0.0 {
+        SamplingStrategy::Greedy { best_of: 1 }
+    } else {
+        SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: 1.0,
+        }
+    };
+    let mut params = FullParams::new(strategy);
+    params.set_language(language);
+    params.set_translate(translate);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_temperature(temperature);
+    if let Some(prompt) = prompt {
+        params.set_initial_prompt(prompt);
+    }
+    params
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
+}
+
+async fn transcribe(
+    AxumState(state): AxumState<AppState>,
+    mut multipart: Multipart,
+) -> Response {
+    let mut file_name: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut model: Option<String> = None;
+    let mut response_format: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut task: Option<String> = None;
+    let mut temperature: Option<f32> = None;
+    let mut prompt: Option<String> = None;
+    let mut size_bytes: Option<usize> = None;
+
+    loop {
+        let next = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(err) => {
+                state
+                    .logs
+                    .push("error", format!("Multipart error: {err}"))
+                    .await;
+                return (StatusCode::BAD_REQUEST, "Invalid multipart payload").into_response();
+            }
+        };
+
+        match next.name().unwrap_or("") {
+            "file" => {
+                file_name = next.file_name().map(|value| value.to_string());
+                match next.bytes().await {
+                    Ok(bytes) => {
+                        size_bytes = Some(bytes.len());
+                        file_bytes = Some(bytes.to_vec());
+                    }
+                    Err(err) => {
+                        state
+                            .logs
+                            .push("error", format!("Failed reading file: {err}"))
+                            .await;
+                        return (StatusCode::BAD_REQUEST, "Invalid file payload")
+                            .into_response();
+                    }
+                }
+            }
+            "model" => {
+                if let Ok(text) = next.text().await {
+                    model = Some(text.trim().to_string());
+                }
+            }
+            "response_format" => {
+                if let Ok(text) = next.text().await {
+                    response_format = Some(text.trim().to_string());
+                }
+            }
+            "language" => {
+                if let Ok(text) = next.text().await {
+                    language = Some(text.trim().to_string());
+                }
+            }
+            "task" => {
+                if let Ok(text) = next.text().await {
+                    task = Some(text.trim().to_string());
+                }
+            }
+            "temperature" => {
+                if let Ok(text) = next.text().await {
+                    temperature = text.trim().parse::<f32>().ok();
+                }
+            }
+            "prompt" => {
+                if let Ok(text) = next.text().await {
+                    prompt = Some(text);
+                }
+            }
+            _ => {
+                let _ = next.bytes().await;
+            }
+        }
+    }
+
+    let file_bytes = match file_bytes {
+        Some(bytes) => bytes,
+        None => {
+            state.logs.push("error", "Missing file field").await;
+            return (StatusCode::BAD_REQUEST, "Missing file field").into_response();
+        }
+    };
+
+    {
+        let mut count = state.requests.lock().await;
+        *count += 1;
+    }
+
+    let selected_model = if let Some(model_id) = model {
+        model_id
+    } else {
+        state.active_model_id.lock().await.clone()
+    };
+    let model_id = normalize_model_id(&selected_model);
+    let entry = match models::model_entry(&model_id) {
+        Some(entry) => entry,
+        None => {
+            let message = format!("Unknown model: {model_id}");
+            state.logs.push("error", message.clone()).await;
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    };
+    let file_label = file_name.clone().unwrap_or_else(|| "unknown".to_string());
+    let size_label = size_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    state
+        .logs
+        .push(
+            "info",
+            format!(
+                "Transcription request model={model_id} file={file_label} bytes={size_label}"
+            ),
+        )
+        .await;
+
+    if entry.engine == models::ModelEngine::Cloud {
+        let model_name = models::cloud_model_name(&model_id)
+            .unwrap_or("glm-asr-2512");
+        let provider = models::cloud_provider(&model_id)
+            .unwrap_or(models::CloudProvider::BigModel);
+        let text = match cloud_transcribe(
+            &state,
+            provider,
+            model_name,
+            file_name.clone(),
+            file_bytes,
+            prompt.clone(),
+            true,
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return (StatusCode::BAD_REQUEST, err).into_response();
+            }
+        };
+        if response_format.as_deref() == Some("text") {
+            return text.into_response();
+        }
+        return Json(TranscriptionResponse { text }).into_response();
+    }
+
+    let extension = file_name
+        .as_ref()
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let temp_path = std::env::temp_dir()
+        .join(format!("openstt-upload-{}.{}", now_millis(), extension));
+    if let Err(err) = tokio::fs::write(&temp_path, &file_bytes).await {
+        let message = format!("Failed to write temp file: {err}");
+        state.logs.push("error", message.clone()).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
+
+    if entry.engine == models::ModelEngine::GlmMlx {
+        let dir = match resolve_models_dir(&state).await {
+            Ok(dir) => dir,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+            }
+        };
+        let marker = models::model_path(&dir, &model_id)
+            .ok_or_else(|| format!("Unknown model: {model_id}"));
+        let marker = match marker {
+            Ok(path) => path,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return (StatusCode::BAD_REQUEST, err).into_response();
+            }
+        };
+        if !marker.exists() {
+            if std::env::var("OPENSTT_AUTO_DOWNLOAD").ok().as_deref() == Some("1") {
+                if let Err(err) = download_model_inner(&state, &model_id).await {
+                    state.logs.push("error", err.clone()).await;
+                    return (StatusCode::BAD_REQUEST, err).into_response();
+                }
+            } else {
+                let err = format!("Model {model_id} not prepared");
+                state.logs.push("error", err.clone()).await;
+                return (StatusCode::BAD_REQUEST, err).into_response();
+            }
+        }
+
+        let text = match glm_transcribe(&state, entry.download_url, &temp_path).await {
+            Ok(text) => text,
+            Err(err) => {
+                state.logs.push("error", err.clone()).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+            }
+        };
+
+        let _ = std::fs::remove_file(&temp_path);
+        if response_format.as_deref() == Some("text") {
+            return text.into_response();
+        }
+        return Json(TranscriptionResponse { text }).into_response();
+    }
+
+    let model_path = match ensure_whisper_model_path(&state, &model_id).await {
+        Ok(path) => path,
+        Err(err) => {
+            state.logs.push("error", err.clone()).await;
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+    };
+
+    let cached_context = {
+        let cached = state.cached_context.lock().await.clone();
+        cached
+            .filter(|entry| entry.model_id == model_id)
+            .map(|entry| entry.context)
+    };
+    let language_value = language.clone();
+    let prompt_value = prompt.clone();
+    let translate = task.as_deref() == Some("translate");
+    let temperature_value = temperature.unwrap_or(0.0);
+    let model_path_value = model_path.clone();
+    let temp_path_value = temp_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let audio = audio::load_and_resample(&temp_path_value)?;
+        let mut new_context: Option<Arc<WhisperContext>> = None;
+        let context = if let Some(context) = cached_context {
+            context
+        } else {
+            let context = WhisperContext::new_with_params(
+                model_path_value
+                    .to_str()
+                    .ok_or_else(|| "Invalid model path".to_string())?,
+                WhisperContextParameters::default(),
+            )
+            .map_err(|err| format!("Failed to load model: {err:?}"))?;
+            let context = Arc::new(context);
+            new_context = Some(Arc::clone(&context));
+            context
+        };
+
+        let params = build_whisper_params(
+            language_value.as_deref(),
+            prompt_value.as_deref(),
+            translate,
+            temperature_value,
+        );
+        let mut state = context
+            .create_state()
+            .map_err(|err| format!("Failed to create whisper state: {err:?}"))?;
+        state
+            .full(params, &audio)
+            .map_err(|err| format!("Transcription failed: {err:?}"))?;
+        let segments = state
+            .full_n_segments()
+            .map_err(|err| format!("Failed to read segments: {err:?}"))?;
+        let mut text = String::new();
+        for index in 0..segments {
+            let segment = state
+                .full_get_segment_text(index)
+                .map_err(|err| format!("Failed to read segment text: {err:?}"))?;
+            text.push_str(&segment);
+        }
+        Ok::<(String, Option<Arc<WhisperContext>>), String>((
+            text.trim().to_string(),
+            new_context,
+        ))
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let (text, new_context) = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            state.logs.push("error", err.clone()).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+        }
+        Err(err) => {
+            let message = format!("Transcription task failed: {err}");
+            state.logs.push("error", message.clone()).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        }
+    };
+
+    if let Some(context) = new_context {
+        let mut cached = state.cached_context.lock().await;
+        *cached = Some(CachedWhisperContext {
+            model_id: model_id.clone(),
+            context,
+        });
+    }
+
+    if response_format.as_deref() == Some("text") {
+        return text.into_response();
+    }
+
+    Json(TranscriptionResponse { text }).into_response()
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .manage(AppState::new())
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+            #[cfg(desktop)]
+            {
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(|app, shortcut, event| {
+                            let state = app.state::<AppState>();
+                            let current = state.dictation_shortcut.blocking_lock().clone();
+                            if current.as_ref().map(|item| item.id())
+                                != Some(shortcut.id())
+                            {
+                                return;
+                            }
+                            let state_value = match event.state() {
+                                ShortcutState::Pressed => "pressed",
+                                ShortcutState::Released => "released",
+                            };
+                            let _ = app.emit(
+                                "dictation-shortcut",
+                                DictationShortcutEvent {
+                                    state: state_value.to_string(),
+                                },
+                            );
+                        })
+                        .build(),
+                )?;
+            }
+            let state = app.state::<AppState>();
+            {
+                let mut handle_guard = state.app_handle.blocking_lock();
+                *handle_guard = Some(app.handle().clone());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                start_modifier_event_tap(app.handle().clone(), (*state).clone());
+            }
+            let base_dir = openstt_dir();
+            let _ = std::fs::create_dir_all(&base_dir);
+
+            let settings_path = settings_path();
+            {
+                let mut path_guard = state.settings_path.blocking_lock();
+                *path_guard = Some(settings_path.clone());
+            }
+            let settings = load_ui_settings(&settings_path);
+            {
+                let mut settings_guard = state.ui_settings.blocking_lock();
+                *settings_guard = settings;
+            }
+            {
+                let app_handle = app.handle().clone();
+                let state_clone = (*state).clone();
+                let dictation_shortcut = state_clone
+                    .ui_settings
+                    .blocking_lock()
+                    .dictation_shortcut
+                    .clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) =
+                        register_dictation_shortcut(&app_handle, &state_clone, &dictation_shortcut).await
+                    {
+                        state_clone
+                            .logs
+                            .push("error", format!("Failed to register dictation shortcut: {err}"))
+                            .await;
+                    }
+                });
+            }
+
+            let config_path = config_path();
+            {
+                let mut config_guard = state.config_path.blocking_lock();
+                *config_guard = Some(config_path.clone());
+            }
+            let config = load_app_config(&config_path);
+            let normalized_model = normalize_model_id(&config.active_model_id);
+            let config_model = if models::model_entry(&normalized_model).is_some() {
+                normalized_model
+            } else {
+                default_model_id()
+            };
+            {
+                let mut model_guard = state.active_model_id.blocking_lock();
+                *model_guard = config_model;
+            }
+
+            let model_dir = models_dir();
+            let _ = std::fs::create_dir_all(&model_dir);
+            let _ = std::fs::create_dir_all(model_dir.join("whisper"));
+            let _ = std::fs::create_dir_all(model_dir.join("glm"));
+            let _ = std::fs::create_dir_all(model_dir.join("cloud"));
+            let _ = std::fs::create_dir_all(glm_cache_dir());
+            {
+                let mut model_guard = state.models_dir.blocking_lock();
+                *model_guard = Some(model_dir);
+            }
+
+            let log_path = logs_path();
+            if let Some(parent) = log_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            state.logs.set_log_path(log_path.clone());
+            state.logs.load_from_file(&log_path);
+
+            let snapshot = {
+                let running = state.runtime.blocking_lock().is_some();
+                let port = *state.port.blocking_lock();
+                let model_id = state.active_model_id.blocking_lock().clone();
+                let cloud = state.cloud_usage.blocking_lock().clone();
+                let dictation = state.dictation_tray_state.blocking_lock().clone();
+                TraySnapshot {
+                    running,
+                    port,
+                    model_id,
+                    cloud_requests: cloud.requests,
+                    cloud_latency_ms: cloud.last_latency_ms,
+                    cloud_provider: cloud.last_provider,
+                    cloud_error: cloud.last_error,
+                    dictation_state: dictation.state,
+                    dictation_queue_len: dictation.queue_len,
+                }
+            };
+            let tray_menu = build_tray_menu(app.handle(), &snapshot)?;
+            let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
+                .menu(&tray_menu)
+                .on_menu_event(|app, event: tauri::menu::MenuEvent| match event.id().as_ref() {
+                    TRAY_OPEN => show_main_window(app),
+                    TRAY_START => {
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app_handle.state::<AppState>();
+                            let port = *state.port.lock().await;
+                            let _ = start_server_inner((*state).clone(), port).await;
+                        });
+                    }
+                    TRAY_STOP => {
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app_handle.state::<AppState>();
+                            let _ = stop_server_inner((*state).clone()).await;
+                        });
+                    }
+                    TRAY_SETTINGS => open_page(app, "settings"),
+                    TRAY_LOGS => open_page(app, "logs"),
+                    TRAY_QUIT => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray: &tauri::tray::TrayIcon<tauri::Wry>, event: TrayIconEvent| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder = tray_builder.icon(icon);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                tray_builder = tray_builder.icon_as_template(true);
+            }
+            tray_builder.build(app)?;
+            tauri::async_runtime::spawn({
+                let state = (*state).clone();
+                async move {
+                    refresh_tray(&state).await;
+                }
+            });
+
+            let autostart = std::env::var("OPENSTT_AUTOSTART")
+                .ok()
+                .map(|value| value != "0")
+                .unwrap_or(true);
+            if autostart {
+                let state_clone = (*state).clone();
+                let port = *state.port.blocking_lock();
+                tauri::async_runtime::spawn(async move {
+                    let _ = start_server_inner(state_clone, port).await;
+                });
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            start_server,
+            stop_server,
+            get_server_status,
+            get_logs,
+            clear_logs,
+            get_ui_settings,
+            set_ui_settings,
+            get_cloud_usage,
+            test_cloud_api_key,
+            transcribe_audio,
+            paste_clipboard,
+            set_dictation_tray_state,
+            list_models,
+            download_model,
+            delete_model,
+            glm_dependency_status,
+            glm_install_dependencies,
+            glm_clear_cache,
+            glm_reset_runtime,
+            get_active_model,
+            set_active_model
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
