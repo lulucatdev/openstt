@@ -128,12 +128,14 @@ struct TraySnapshot {
     model_id: String,
     dictation_state: String,
     dictation_queue_len: u32,
+    dictation_elapsed: Option<String>,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct DictationTrayState {
     state: String,
     queue_len: u32,
+    phase_started: Option<Instant>,
 }
 
 impl Default for DictationTrayState {
@@ -141,6 +143,7 @@ impl Default for DictationTrayState {
         Self {
             state: "idle".to_string(),
             queue_len: 0,
+            phase_started: None,
         }
     }
 }
@@ -538,6 +541,7 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                             let mut tray = app_state.dictation_tray_state.lock().await;
                             tray.state = "listening".to_string();
                             tray.queue_len = app_state.dictation.queue_len().await;
+                            tray.phase_started = Some(Instant::now());
                             drop(tray);
                             refresh_tray(&app_state).await;
                             recompute_and_emit_app_status(&app_state).await;
@@ -547,17 +551,27 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                     tauri::async_runtime::spawn(async move {
                         let _ = app_state.dictation.stop_recording().await;
                         app_state.dictation.emit_state(&app_handle).await;
-                        let mut tray = app_state.dictation_tray_state.lock().await;
-                        tray.state = app_state.dictation.current_state().as_str().to_string();
-                        tray.queue_len = app_state.dictation.queue_len().await;
-                        drop(tray);
+                        let has_queue = app_state.dictation.queue_len().await > 0;
+                        {
+                            let mut tray = app_state.dictation_tray_state.lock().await;
+                            if has_queue {
+                                tray.state = "processing".to_string();
+                                tray.phase_started = Some(Instant::now());
+                            } else {
+                                tray.state = "idle".to_string();
+                                tray.phase_started = None;
+                            }
+                            tray.queue_len = app_state.dictation.queue_len().await;
+                        }
                         refresh_tray(&app_state).await;
                         recompute_and_emit_app_status(&app_state).await;
                         app_state.dictation.process_queue(&app_state, &app_handle).await;
-                        let mut tray = app_state.dictation_tray_state.lock().await;
-                        tray.state = app_state.dictation.current_state().as_str().to_string();
-                        tray.queue_len = app_state.dictation.queue_len().await;
-                        drop(tray);
+                        {
+                            let mut tray = app_state.dictation_tray_state.lock().await;
+                            tray.state = "idle".to_string();
+                            tray.phase_started = None;
+                            tray.queue_len = 0;
+                        }
                         refresh_tray(&app_state).await;
                         recompute_and_emit_app_status(&app_state).await;
                     });
@@ -608,11 +622,15 @@ fn open_page<R: tauri::Runtime>(app: &tauri::AppHandle<R>, page: &str) {
     let _ = app.emit("open-page", page);
 }
 
-fn format_dictation_state(state: &str) -> &'static str {
-    match state {
+fn format_dictation_state(state: &str, elapsed: &Option<String>) -> String {
+    let label = match state {
         "listening" => "Listening",
         "processing" => "Processing",
-        _ => "Idle",
+        _ => return "Idle".to_string(),
+    };
+    match elapsed {
+        Some(e) => format!("{label} {e}"),
+        None => label.to_string(),
     }
 }
 
@@ -666,7 +684,7 @@ fn build_tray_menu<R: tauri::Runtime>(
     let dictation_item = MenuItem::with_id(
         app,
         "tray-dictation",
-        format!("Dictation: {}", format_dictation_state(&snapshot.dictation_state)),
+        format!("Dictation: {}", format_dictation_state(&snapshot.dictation_state, &snapshot.dictation_elapsed)),
         false,
         None::<String>,
     )?;
@@ -702,12 +720,16 @@ async fn tray_snapshot(state: &AppState) -> TraySnapshot {
     let port = *state.port.lock().await;
     let model_id = state.active_model_id.lock().await.clone();
     let dictation = state.dictation_tray_state.lock().await.clone();
+    let dictation_elapsed = dictation.phase_started.map(|started| {
+        format!("{:.1}s", started.elapsed().as_secs_f64())
+    });
     TraySnapshot {
         running,
         port,
         model_id,
         dictation_state: dictation.state,
         dictation_queue_len: dictation.queue_len,
+        dictation_elapsed,
     }
 }
 
@@ -731,6 +753,13 @@ async fn refresh_tray(state: &AppState) {
     if let Some(tray) = app_handle.tray_by_id(TRAY_ID) {
         let _ = tray.set_menu(Some(menu));
         let _ = tray.set_tooltip(Some(tray_tooltip(&snapshot)));
+        let title = match snapshot.dictation_state.as_str() {
+            "listening" | "processing" => {
+                format_dictation_state(&snapshot.dictation_state, &snapshot.dictation_elapsed)
+            }
+            _ => String::new(),
+        };
+        let _ = tray.set_title(Some(&title));
     }
 }
 
@@ -1654,6 +1683,7 @@ async fn start_dictation(state: TauriState<'_, AppState>) -> Result<(), String> 
     let mut tray_state = state.dictation_tray_state.lock().await;
     tray_state.state = "listening".to_string();
     tray_state.queue_len = state.dictation.queue_len().await;
+    tray_state.phase_started = Some(Instant::now());
     drop(tray_state);
     refresh_tray(&state).await;
     recompute_and_emit_app_status(&state).await;
@@ -1666,10 +1696,18 @@ async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
     if let Some(app_handle) = state.app_handle.lock().await.clone() {
         state.dictation.emit_state(&app_handle).await;
     }
-    let mut tray_state = state.dictation_tray_state.lock().await;
-    tray_state.state = state.dictation.current_state().as_str().to_string();
-    tray_state.queue_len = state.dictation.queue_len().await;
-    drop(tray_state);
+    let has_queue = state.dictation.queue_len().await > 0;
+    {
+        let mut tray_state = state.dictation_tray_state.lock().await;
+        if has_queue {
+            tray_state.state = "processing".to_string();
+            tray_state.phase_started = Some(Instant::now());
+        } else {
+            tray_state.state = "idle".to_string();
+            tray_state.phase_started = None;
+        }
+        tray_state.queue_len = state.dictation.queue_len().await;
+    }
     refresh_tray(&state).await;
     recompute_and_emit_app_status(&state).await;
     let app_state = (*state).clone();
@@ -1677,10 +1715,12 @@ async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
     tauri::async_runtime::spawn(async move {
         if let Some(app_handle) = app_handle {
             app_state.dictation.process_queue(&app_state, &app_handle).await;
-            let mut tray_state = app_state.dictation_tray_state.lock().await;
-            tray_state.state = app_state.dictation.current_state().as_str().to_string();
-            tray_state.queue_len = app_state.dictation.queue_len().await;
-            drop(tray_state);
+            {
+                let mut tray_state = app_state.dictation_tray_state.lock().await;
+                tray_state.state = "idle".to_string();
+                tray_state.phase_started = None;
+                tray_state.queue_len = 0;
+            }
             refresh_tray(&app_state).await;
             recompute_and_emit_app_status(&app_state).await;
         }
@@ -2463,6 +2503,7 @@ pub fn run() {
                                         let mut tray = app_state.dictation_tray_state.lock().await;
                                         tray.state = "listening".to_string();
                                         tray.queue_len = app_state.dictation.queue_len().await;
+                                        tray.phase_started = Some(Instant::now());
                                         drop(tray);
                                         refresh_tray(&app_state).await;
                                         recompute_and_emit_app_status(&app_state).await;
@@ -2472,17 +2513,27 @@ pub fn run() {
                                     tauri::async_runtime::spawn(async move {
                                         let _ = app_state.dictation.stop_recording().await;
                                         app_state.dictation.emit_state(&app_handle).await;
-                                        let mut tray = app_state.dictation_tray_state.lock().await;
-                                        tray.state = app_state.dictation.current_state().as_str().to_string();
-                                        tray.queue_len = app_state.dictation.queue_len().await;
-                                        drop(tray);
+                                        let has_queue = app_state.dictation.queue_len().await > 0;
+                                        {
+                                            let mut tray = app_state.dictation_tray_state.lock().await;
+                                            if has_queue {
+                                                tray.state = "processing".to_string();
+                                                tray.phase_started = Some(Instant::now());
+                                            } else {
+                                                tray.state = "idle".to_string();
+                                                tray.phase_started = None;
+                                            }
+                                            tray.queue_len = app_state.dictation.queue_len().await;
+                                        }
                                         refresh_tray(&app_state).await;
                                         recompute_and_emit_app_status(&app_state).await;
                                         app_state.dictation.process_queue(&app_state, &app_handle).await;
-                                        let mut tray = app_state.dictation_tray_state.lock().await;
-                                        tray.state = app_state.dictation.current_state().as_str().to_string();
-                                        tray.queue_len = app_state.dictation.queue_len().await;
-                                        drop(tray);
+                                        {
+                                            let mut tray = app_state.dictation_tray_state.lock().await;
+                                            tray.state = "idle".to_string();
+                                            tray.phase_started = None;
+                                            tray.queue_len = 0;
+                                        }
                                         refresh_tray(&app_state).await;
                                         recompute_and_emit_app_status(&app_state).await;
                                     });
@@ -2573,12 +2624,16 @@ pub fn run() {
                 let port = *state.port.blocking_lock();
                 let model_id = state.active_model_id.blocking_lock().clone();
                 let dictation = state.dictation_tray_state.blocking_lock().clone();
+                let dictation_elapsed = dictation.phase_started.map(|started| {
+                    format!("{:.1}s", started.elapsed().as_secs_f64())
+                });
                 TraySnapshot {
                     running,
                     port,
                     model_id,
                     dictation_state: dictation.state,
                     dictation_queue_len: dictation.queue_len,
+                    dictation_elapsed,
                 }
             };
             let tray_menu = build_tray_menu(app.handle(), &snapshot)?;
@@ -2623,6 +2678,23 @@ pub fn run() {
                 let state = (*state).clone();
                 async move {
                     refresh_tray(&state).await;
+                }
+            });
+
+            // Spawn 100ms ticker to update tray timer during active dictation phases
+            tauri::async_runtime::spawn({
+                let state_for_ticker = (*state).clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let is_active = {
+                            let tray = state_for_ticker.dictation_tray_state.lock().await;
+                            tray.state != "idle"
+                        };
+                        if is_active {
+                            refresh_tray(&state_for_ticker).await;
+                        }
+                    }
                 }
             });
 
