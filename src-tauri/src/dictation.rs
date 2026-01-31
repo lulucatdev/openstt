@@ -1,6 +1,7 @@
 use crate::recording::{self, RecordingSession};
 use crate::AppState;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Mutex as StdMutex;
 use tauri::Emitter;
 use tokio::sync::Mutex;
@@ -38,26 +39,35 @@ pub struct PlaygroundTranscriptionResult {
 }
 
 pub struct DictationManager {
-    state: StdMutex<DictationState>,
     recording: StdMutex<Option<RecordingSession>>,
     playground_recording: StdMutex<Option<RecordingSession>>,
-    queue: Mutex<Vec<Vec<u8>>>,
+    queue: Mutex<VecDeque<Vec<u8>>>,
     processing: Mutex<bool>,
 }
 
 impl DictationManager {
     pub fn new() -> Self {
         Self {
-            state: StdMutex::new(DictationState::Idle),
             recording: StdMutex::new(None),
             playground_recording: StdMutex::new(None),
-            queue: Mutex::new(Vec::new()),
+            queue: Mutex::new(VecDeque::new()),
             processing: Mutex::new(false),
         }
     }
 
+    /// Derive state from actual conditions rather than storing it.
+    /// Recording takes priority: if mic is active the user sees "listening"
+    /// even while the queue is draining in the background.
     pub fn current_state(&self) -> DictationState {
-        *self.state.lock().unwrap()
+        let is_recording = self.recording.lock().unwrap().is_some();
+        if is_recording {
+            return DictationState::Listening;
+        }
+        let is_processing = self.processing.try_lock().map(|g| *g).unwrap_or(false);
+        if is_processing {
+            return DictationState::Processing;
+        }
+        DictationState::Idle
     }
 
     pub async fn queue_len(&self) -> u32 {
@@ -66,14 +76,8 @@ impl DictationManager {
 
     pub fn start_recording(&self) -> Result<(), String> {
         let session = RecordingSession::start()?;
-        {
-            let mut rec = self.recording.lock().unwrap();
-            *rec = Some(session);
-        }
-        {
-            let mut state = self.state.lock().unwrap();
-            *state = DictationState::Listening;
-        }
+        let mut rec = self.recording.lock().unwrap();
+        *rec = Some(session);
         Ok(())
     }
 
@@ -82,12 +86,6 @@ impl DictationManager {
             let mut rec = self.recording.lock().unwrap();
             rec.take()
         };
-        {
-            let mut state = self.state.lock().unwrap();
-            if *state == DictationState::Listening {
-                *state = DictationState::Idle;
-            }
-        }
 
         let Some(session) = session else {
             return Ok(self.current_state());
@@ -99,10 +97,7 @@ impl DictationManager {
         }
 
         let wav = recording::encode_wav(&samples, sample_rate);
-        {
-            let mut queue = self.queue.lock().await;
-            queue.push(wav);
-        }
+        self.queue.lock().await.push_back(wav);
 
         Ok(self.current_state())
     }
@@ -119,20 +114,14 @@ impl DictationManager {
             }
             *processing = true;
         }
+        self.emit_state(app_handle).await;
 
         loop {
-            let wav = {
-                let mut queue = self.queue.lock().await;
-                queue.pop()
-            };
+            let wav = self.queue.lock().await.pop_front();
             let Some(wav) = wav else {
                 break;
             };
 
-            {
-                let mut state = self.state.lock().unwrap();
-                *state = DictationState::Processing;
-            }
             self.emit_state(app_handle).await;
 
             let result = crate::transcribe_bytes(
@@ -181,12 +170,6 @@ impl DictationManager {
         {
             let mut processing = self.processing.lock().await;
             *processing = false;
-        }
-        {
-            let mut state = self.state.lock().unwrap();
-            if *state == DictationState::Processing {
-                *state = DictationState::Idle;
-            }
         }
         self.emit_state(app_handle).await;
     }
