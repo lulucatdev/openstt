@@ -31,6 +31,10 @@ npm run tauri dev
 npm run tauri build
 ```
 
+## Roadmap
+
+- [ ] Migrate macOS MLX inference from Python sidecar to [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) for native performance and zero Python dependency
+
 ## License
 
 MIT
@@ -69,6 +73,10 @@ npm run tauri dev
 # 生产构建
 npm run tauri build
 ```
+
+## 路线图
+
+- [ ] 将 macOS MLX 推理从 Python 侧车迁移到 [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift)，实现原生性能、无需 Python 依赖
 
 ## 许可证
 
