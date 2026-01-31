@@ -82,6 +82,13 @@ type PlaygroundTranscriptionResult = {
   error: string | null;
 };
 
+type DownloadProgressEvent = {
+  modelId: string;
+  percent: number;
+  done: boolean;
+  error: string | null;
+};
+
 type GlmDependencyStatus = {
   supported: boolean;
   ready: boolean;
@@ -586,6 +593,9 @@ function App() {
     id: string;
     type: "download" | "activate";
   } | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<
+    Record<string, number>
+  >({});
   const language = uiSettings.language ?? "en";
   const t = (key: keyof (typeof translations)["en"], params?: Record<string, number | string>) => {
     const template =
@@ -951,6 +961,36 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      unlisten = await listen<DownloadProgressEvent>(
+        "download-progress",
+        (event) => {
+          const { modelId, percent, done, error } = event.payload;
+          if (done) {
+            setDownloadProgress((prev) => {
+              const next = { ...prev };
+              delete next[modelId];
+              return next;
+            });
+            if (error) {
+              setError(error);
+            }
+            void refreshModels();
+          } else {
+            setDownloadProgress((prev) => ({ ...prev, [modelId]: percent }));
+          }
+        },
+      );
+    })();
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!drawerOpen) {
       return;
     }
@@ -1196,14 +1236,10 @@ function App() {
       setError(t("runtimeRequired"));
       return;
     }
-    setModelAction({ id: modelId, type: "download" });
     try {
-      await invoke<ModelInfo>("download_model", { modelId });
-      await refreshModels();
+      await invoke("download_model", { modelId });
     } catch (err) {
       setError(String(err));
-    } finally {
-      setModelAction(null);
     }
   };
 
@@ -1230,19 +1266,16 @@ function App() {
     }
     setError(null);
     setGlmAction("setup");
-    setModelAction({ id: modelId, type: "download" });
     try {
       if (!(glmDeps?.ready ?? false)) {
         await invoke<GlmDependencyStatus>("glm_install_dependencies");
         await refreshGlmDeps();
       }
-      await invoke<ModelInfo>("download_model", { modelId });
-      await refreshModels();
+      await invoke("download_model", { modelId });
     } catch (err) {
       setError(String(err));
     } finally {
       setGlmAction(null);
-      setModelAction(null);
     }
   };
 
@@ -1790,9 +1823,8 @@ function App() {
                         (modelsTab === "whisper" ? whisperModels : pythonModels).map(
                           (model) => {
                             const isActive = model.id === activeModelId;
-                            const isDownloading =
-                              modelAction?.id === model.id &&
-                              modelAction.type === "download";
+                            const dlPercent = downloadProgress[model.id];
+                            const isDownloading = dlPercent !== undefined;
                             const isActivating =
                               modelAction?.id === model.id &&
                               modelAction.type === "activate";
@@ -1852,7 +1884,7 @@ function App() {
                                           : handleDownloadModel(model.id)
                                       }
                                       disabled={
-                                        Boolean(modelAction) || glmAction === "setup"
+                                        isDownloading || glmAction === "setup"
                                       }
                                     >
                                       {isGlm && !(glmDeps?.ready ?? false)
@@ -1860,7 +1892,7 @@ function App() {
                                           ? t("settingUp")
                                           : t("setup")
                                         : isDownloading
-                                          ? t("downloading")
+                                          ? `${dlPercent}%`
                                           : t("download")}
                                     </button>
                                   )}

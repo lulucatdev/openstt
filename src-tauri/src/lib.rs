@@ -2002,8 +2002,19 @@ async fn list_models(state: TauriState<'_, AppState>) -> Result<Vec<models::Mode
 async fn download_model(
     state: TauriState<'_, AppState>,
     model_id: String,
-) -> Result<models::ModelInfo, String> {
-    download_model_inner(&*state, &model_id).await
+) -> Result<(), String> {
+    let app_state = (*state).clone();
+    let model_id_clone = model_id.clone();
+    tauri::async_runtime::spawn(async move {
+        match download_model_inner(&app_state, &model_id_clone).await {
+            Ok(_) => {}
+            Err(err) => {
+                app_state.logs.push("error", err.clone()).await;
+                emit_download_progress_async(&app_state, &model_id_clone, 0, true, Some(err)).await;
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -2077,6 +2088,29 @@ async fn set_active_model(
     Ok(model_id)
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgressEvent {
+    model_id: String,
+    percent: u32,
+    done: bool,
+    error: Option<String>,
+}
+
+async fn emit_download_progress_async(state: &AppState, model_id: &str, percent: u32, done: bool, error: Option<String>) {
+    if let Some(app_handle) = state.app_handle.lock().await.clone() {
+        let _ = app_handle.emit(
+            "download-progress",
+            DownloadProgressEvent {
+                model_id: model_id.to_string(),
+                percent,
+                done,
+                error,
+            },
+        );
+    }
+}
+
 async fn download_model_inner(
     state: &AppState,
     model_id: &str,
@@ -2137,23 +2171,39 @@ async fn download_model_inner(
     let mut stream = response.bytes_stream();
     let mut downloaded: u64 = 0;
     let mut next_log_at = 50 * 1024 * 1024;
+    let mut last_emit = Instant::now();
+
+    emit_download_progress_async(state, model_id, 0, false, None).await;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| format!("Download error: {err}"))?;
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                let msg = format!("Download error: {err}");
+                emit_download_progress_async(state, model_id, 0, true, Some(msg.clone())).await;
+                return Err(msg);
+            }
+        };
         file.write_all(&chunk)
             .await
             .map_err(|err| format!("Failed to write model file: {err}"))?;
         downloaded += chunk.len() as u64;
-        if total > 0 && downloaded >= next_log_at {
-            let percent = (downloaded as f64 / total as f64 * 100.0).round();
-            state
-                .logs
-                .push(
-                    "info",
-                    format!("Downloading {model_id}: {percent}%"),
-                )
-                .await;
-            next_log_at += 50 * 1024 * 1024;
+        if total > 0 {
+            let percent = (downloaded as f64 / total as f64 * 100.0).round() as u32;
+            if last_emit.elapsed() >= Duration::from_millis(500) || percent >= 100 {
+                emit_download_progress_async(state, model_id, percent, false, None).await;
+                last_emit = Instant::now();
+            }
+            if downloaded >= next_log_at {
+                state
+                    .logs
+                    .push(
+                        "info",
+                        format!("Downloading {model_id}: {percent}%"),
+                    )
+                    .await;
+                next_log_at += 50 * 1024 * 1024;
+            }
         }
     }
 
@@ -2164,6 +2214,7 @@ async fn download_model_inner(
         .logs
         .push("info", format!("Model {model_id} downloaded"))
         .await;
+    emit_download_progress_async(state, model_id, 100, true, None).await;
 
     let models = models::list_models(&dir);
     models
