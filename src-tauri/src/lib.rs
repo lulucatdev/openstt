@@ -39,7 +39,7 @@ use tokio::{
     sync::{oneshot, Mutex},
     time::{sleep, Duration},
 };
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 #[derive(Clone)]
 struct AppState {
@@ -61,6 +61,8 @@ struct AppState {
     dictation_shortcut: Arc<Mutex<Option<Shortcut>>>,
     dictation_tray_state: Arc<Mutex<DictationTrayState>>,
     dictation: Arc<dictation::DictationManager>,
+    downloading: Arc<Mutex<bool>>,
+    app_status: Arc<Mutex<AppStatus>>,
 }
 
 struct ServerRuntime {
@@ -99,10 +101,10 @@ struct GlmDependencyStatus {
     message: Option<String>,
 }
 
-#[derive(Clone)]
 struct CachedWhisperContext {
     model_id: String,
     context: Arc<WhisperContext>,
+    state: WhisperState,
 }
 
 struct LogState {
@@ -154,6 +156,33 @@ impl Default for DictationTrayState {
             queue_len: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AppStatus {
+    Stopped,
+    Loading,
+    Ready,
+    Listening,
+    Transcribing,
+}
+
+impl AppStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            AppStatus::Stopped => "stopped",
+            AppStatus::Loading => "loading",
+            AppStatus::Ready => "ready",
+            AppStatus::Listening => "listening",
+            AppStatus::Transcribing => "transcribing",
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct AppStatusEvent {
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -417,6 +446,8 @@ impl AppState {
             dictation_shortcut: Arc::new(Mutex::new(None)),
             dictation_tray_state: Arc::new(Mutex::new(DictationTrayState::default())),
             dictation: Arc::new(dictation::DictationManager::new()),
+            downloading: Arc::new(Mutex::new(false)),
+            app_status: Arc::new(Mutex::new(AppStatus::Stopped)),
         }
     }
 }
@@ -544,6 +575,7 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                             tray.queue_len = app_state.dictation.queue_len().await;
                             drop(tray);
                             refresh_tray(&app_state).await;
+                            recompute_and_emit_app_status(&app_state).await;
                         });
                     }
                 } else {
@@ -555,12 +587,14 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                         tray.queue_len = app_state.dictation.queue_len().await;
                         drop(tray);
                         refresh_tray(&app_state).await;
+                        recompute_and_emit_app_status(&app_state).await;
                         app_state.dictation.process_queue(&app_state, &app_handle).await;
                         let mut tray = app_state.dictation_tray_state.lock().await;
                         tray.state = app_state.dictation.current_state().as_str().to_string();
                         tray.queue_len = app_state.dictation.queue_len().await;
                         drop(tray);
                         refresh_tray(&app_state).await;
+                        recompute_and_emit_app_status(&app_state).await;
                     });
                 }
                 Some(event.clone())
@@ -831,6 +865,34 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+async fn emit_app_status(state: &AppState, status: AppStatus) {
+    *state.app_status.lock().await = status;
+    if let Some(handle) = state.app_handle.lock().await.clone() {
+        let _ = handle.emit(
+            "app-status-changed",
+            AppStatusEvent {
+                status: status.as_str().to_string(),
+            },
+        );
+    }
+}
+
+async fn recompute_and_emit_app_status(state: &AppState) {
+    let dictation_state = state.dictation.current_state();
+    let status = match dictation_state {
+        dictation::DictationState::Listening => AppStatus::Listening,
+        dictation::DictationState::Processing => AppStatus::Transcribing,
+        dictation::DictationState::Idle => {
+            if state.runtime.lock().await.is_some() {
+                AppStatus::Ready
+            } else {
+                AppStatus::Stopped
+            }
+        }
+    };
+    emit_app_status(state, status).await;
 }
 
 fn openstt_dir() -> PathBuf {
@@ -1584,12 +1646,21 @@ pub(crate) async fn transcribe_bytes(
         }
     };
 
-    let cached_context = {
-        let cached = state.cached_context.lock().await.clone();
-        cached
-            .filter(|entry| entry.model_id == model_id)
-            .map(|entry| entry.context)
+    // Take the cached context+state out of the mutex (we'll put it back after)
+    let cached = {
+        let mut guard = state.cached_context.lock().await;
+        guard.take()
     };
+    let (cached_ctx, cached_state) = match cached {
+        Some(c) if c.model_id == model_id => (Some(c.context), Some(c.state)),
+        other => {
+            // Put back if model didn't match (different model cached)
+            let mut guard = state.cached_context.lock().await;
+            *guard = other;
+            (None, None)
+        }
+    };
+
     let language_value = language.clone();
     let prompt_value = prompt.clone();
     let translate = task.as_deref() == Some("translate");
@@ -1599,20 +1670,28 @@ pub(crate) async fn transcribe_bytes(
 
     let result = tokio::task::spawn_blocking(move || {
         let audio = audio::load_and_resample(&temp_path_value)?;
-        let mut new_context: Option<Arc<WhisperContext>> = None;
-        let context = if let Some(context) = cached_context {
+        let context = if let Some(context) = cached_ctx {
             context
         } else {
+            let mut params = WhisperContextParameters::default();
+            params.use_gpu(true);
+            params.flash_attn(true);
             let context = WhisperContext::new_with_params(
                 model_path_value
                     .to_str()
                     .ok_or_else(|| "Invalid model path".to_string())?,
-                WhisperContextParameters::default(),
+                params,
             )
             .map_err(|err| format!("Failed to load model: {err:?}"))?;
-            let context = Arc::new(context);
-            new_context = Some(Arc::clone(&context));
+            Arc::new(context)
+        };
+
+        let mut wstate = if let Some(wstate) = cached_state {
+            wstate
+        } else {
             context
+                .create_state()
+                .map_err(|err| format!("Failed to create whisper state: {err:?}"))?
         };
 
         let params = build_whisper_params(
@@ -1621,31 +1700,28 @@ pub(crate) async fn transcribe_bytes(
             translate,
             temperature_value,
         );
-        let mut state = context
-            .create_state()
-            .map_err(|err| format!("Failed to create whisper state: {err:?}"))?;
-        state
+        wstate
             .full(params, &audio)
             .map_err(|err| format!("Transcription failed: {err:?}"))?;
-        let segments = state
+        let segments = wstate
             .full_n_segments()
             .map_err(|err| format!("Failed to read segments: {err:?}"))?;
         let mut text = String::new();
         for index in 0..segments {
-            let segment = state
+            let segment = wstate
                 .full_get_segment_text(index)
                 .map_err(|err| format!("Failed to read segment text: {err:?}"))?;
             text.push_str(&segment);
         }
-        Ok::<(String, Option<Arc<WhisperContext>>), String>(
-            (text.trim().to_string(), new_context),
+        Ok::<(String, Arc<WhisperContext>, WhisperState), String>(
+            (text.trim().to_string(), context, wstate),
         )
     })
     .await;
 
     let _ = std::fs::remove_file(&temp_path);
 
-    let (text, new_context) = match result {
+    let (text, context, wstate) = match result {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             state.logs.push("error", err.clone()).await;
@@ -1658,11 +1734,12 @@ pub(crate) async fn transcribe_bytes(
         }
     };
 
-    if let Some(context) = new_context {
+    {
         let mut cached = state.cached_context.lock().await;
         *cached = Some(CachedWhisperContext {
             model_id: model_id.clone(),
             context,
+            state: wstate,
         });
     }
 
@@ -1752,6 +1829,7 @@ async fn start_server_inner(app_state: AppState, port: u16) -> Result<ServerStat
     *app_state.runtime.lock().await = Some(runtime);
 
     refresh_tray(&app_state).await;
+    recompute_and_emit_app_status(&app_state).await;
 
     Ok(build_status(&app_state).await)
 }
@@ -1767,6 +1845,7 @@ async fn stop_server_inner(app_state: AppState) -> Result<ServerStatus, String> 
 
     *app_state.started_at.lock().await = None;
     refresh_tray(&app_state).await;
+    emit_app_status(&app_state, AppStatus::Stopped).await;
     Ok(build_status(&app_state).await)
 }
 
@@ -1786,6 +1865,11 @@ async fn stop_server(state: TauriState<'_, AppState>) -> Result<ServerStatus, St
 #[tauri::command]
 async fn get_server_status(state: TauriState<'_, AppState>) -> Result<ServerStatus, String> {
     Ok(build_status(&(*state).clone()).await)
+}
+
+#[tauri::command]
+async fn get_app_status(state: TauriState<'_, AppState>) -> Result<String, String> {
+    Ok(state.app_status.lock().await.as_str().to_string())
 }
 
 #[tauri::command]
@@ -1864,6 +1948,7 @@ async fn start_dictation(state: TauriState<'_, AppState>) -> Result<(), String> 
     tray_state.queue_len = state.dictation.queue_len().await;
     drop(tray_state);
     refresh_tray(&state).await;
+    recompute_and_emit_app_status(&state).await;
     Ok(())
 }
 
@@ -1878,6 +1963,7 @@ async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
     tray_state.queue_len = state.dictation.queue_len().await;
     drop(tray_state);
     refresh_tray(&state).await;
+    recompute_and_emit_app_status(&state).await;
     let app_state = (*state).clone();
     let app_handle = state.app_handle.lock().await.clone();
     tauri::async_runtime::spawn(async move {
@@ -1888,6 +1974,7 @@ async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
             tray_state.queue_len = app_state.dictation.queue_len().await;
             drop(tray_state);
             refresh_tray(&app_state).await;
+            recompute_and_emit_app_status(&app_state).await;
         }
     });
     Ok(())
@@ -2003,6 +2090,13 @@ async fn download_model(
     state: TauriState<'_, AppState>,
     model_id: String,
 ) -> Result<(), String> {
+    {
+        let mut downloading = state.downloading.lock().await;
+        if *downloading {
+            return Err("Another download is already in progress".to_string());
+        }
+        *downloading = true;
+    }
     let app_state = (*state).clone();
     let model_id_clone = model_id.clone();
     tauri::async_runtime::spawn(async move {
@@ -2013,6 +2107,7 @@ async fn download_model(
                 emit_download_progress_async(&app_state, &model_id_clone, 0, true, Some(err)).await;
             }
         }
+        *app_state.downloading.lock().await = false;
     });
     Ok(())
 }
@@ -2085,6 +2180,10 @@ async fn set_active_model(
         .push("info", format!("Active model set to {model_id}"))
         .await;
     refresh_tray(&state).await;
+    let preload_state = (*state).clone();
+    tauri::async_runtime::spawn(async move {
+        preload_active_model(&preload_state).await;
+    });
     Ok(model_id)
 }
 
@@ -2242,6 +2341,114 @@ async fn ensure_whisper_model_path(state: &AppState, model_id: &str) -> Result<P
         }
     }
     Err(format!("Model {model_id} not downloaded"))
+}
+
+async fn preload_whisper_model(state: &AppState) {
+    let model_id = state.active_model_id.lock().await.clone();
+    let model_path = match ensure_whisper_model_path(state, &model_id).await {
+        Ok(p) => p,
+        Err(_) => return, // model not downloaded yet, nothing to preload
+    };
+
+    // Already cached?
+    {
+        let guard = state.cached_context.lock().await;
+        if guard.as_ref().map(|c| c.model_id.as_str()) == Some(model_id.as_str()) {
+            return;
+        }
+    }
+
+    state
+        .logs
+        .push("info", format!("Pre-loading model {model_id}…"))
+        .await;
+
+    let model_path_value = model_path.clone();
+    let loaded = tokio::task::spawn_blocking(move || {
+        let mut params = WhisperContextParameters::default();
+        params.use_gpu(true);
+        params.flash_attn(true);
+        let context = WhisperContext::new_with_params(
+            model_path_value
+                .to_str()
+                .ok_or_else(|| "Invalid model path".to_string())?,
+            params,
+        )
+        .map_err(|err| format!("Failed to load model: {err:?}"))?;
+        let context = Arc::new(context);
+        let wstate = context
+            .create_state()
+            .map_err(|err| format!("Failed to create whisper state: {err:?}"))?;
+        Ok::<(Arc<WhisperContext>, WhisperState), String>((context, wstate))
+    })
+    .await;
+
+    match loaded {
+        Ok(Ok((context, wstate))) => {
+            let mut guard = state.cached_context.lock().await;
+            *guard = Some(CachedWhisperContext {
+                model_id,
+                context,
+                state: wstate,
+            });
+            state.logs.push("info", "Model pre-loaded and ready".to_string()).await;
+        }
+        Ok(Err(err)) => {
+            state
+                .logs
+                .push("error", format!("Model pre-load failed: {err}"))
+                .await;
+        }
+        Err(err) => {
+            state
+                .logs
+                .push("error", format!("Model pre-load task panicked: {err}"))
+                .await;
+        }
+    }
+}
+
+async fn preload_glm_model(state: &AppState) {
+    let model_id = state.active_model_id.lock().await.clone();
+    let entry = match models::model_entry(&model_id) {
+        Some(e) if e.engine == models::ModelEngine::GlmMlx => e,
+        _ => return,
+    };
+    // Check if sidecar is already running for this model
+    {
+        let guard = state.glm_sidecar.lock().await;
+        if let Some(sidecar) = guard.as_ref() {
+            if sidecar.model_id == model_id && glm_health(sidecar.port).await {
+                return;
+            }
+        }
+    }
+    emit_app_status(state, AppStatus::Loading).await;
+    state
+        .logs
+        .push("info", format!("Pre-loading GLM model {model_id}…"))
+        .await;
+    match ensure_glm_sidecar(state, entry.download_url).await {
+        Ok(port) => state
+            .logs
+            .push("info", format!("GLM sidecar ready on port {port}"))
+            .await,
+        Err(err) => state
+            .logs
+            .push("error", format!("GLM pre-load failed: {err}"))
+            .await,
+    }
+}
+
+async fn preload_active_model(state: &AppState) {
+    emit_app_status(state, AppStatus::Loading).await;
+    let model_id = state.active_model_id.lock().await.clone();
+    match models::model_entry(&model_id).map(|e| e.engine) {
+        Some(models::ModelEngine::Whisper) => preload_whisper_model(state).await,
+        Some(models::ModelEngine::GlmMlx) => preload_glm_model(state).await,
+        _ => {} // Cloud models don't need preloading
+    }
+    recompute_and_emit_app_status(state).await;
 }
 
 fn build_whisper_params<'a>(
@@ -2492,12 +2699,19 @@ async fn transcribe(
         }
     };
 
-    let cached_context = {
-        let cached = state.cached_context.lock().await.clone();
-        cached
-            .filter(|entry| entry.model_id == model_id)
-            .map(|entry| entry.context)
+    let cached = {
+        let mut guard = state.cached_context.lock().await;
+        guard.take()
     };
+    let (cached_ctx, cached_state) = match cached {
+        Some(c) if c.model_id == model_id => (Some(c.context), Some(c.state)),
+        other => {
+            let mut guard = state.cached_context.lock().await;
+            *guard = other;
+            (None, None)
+        }
+    };
+
     let language_value = language.clone();
     let prompt_value = prompt.clone();
     let translate = task.as_deref() == Some("translate");
@@ -2507,20 +2721,28 @@ async fn transcribe(
 
     let result = tokio::task::spawn_blocking(move || {
         let audio = audio::load_and_resample(&temp_path_value)?;
-        let mut new_context: Option<Arc<WhisperContext>> = None;
-        let context = if let Some(context) = cached_context {
+        let context = if let Some(context) = cached_ctx {
             context
         } else {
+            let mut params = WhisperContextParameters::default();
+            params.use_gpu(true);
+            params.flash_attn(true);
             let context = WhisperContext::new_with_params(
                 model_path_value
                     .to_str()
                     .ok_or_else(|| "Invalid model path".to_string())?,
-                WhisperContextParameters::default(),
+                params,
             )
             .map_err(|err| format!("Failed to load model: {err:?}"))?;
-            let context = Arc::new(context);
-            new_context = Some(Arc::clone(&context));
+            Arc::new(context)
+        };
+
+        let mut wstate = if let Some(wstate) = cached_state {
+            wstate
+        } else {
             context
+                .create_state()
+                .map_err(|err| format!("Failed to create whisper state: {err:?}"))?
         };
 
         let params = build_whisper_params(
@@ -2529,32 +2751,30 @@ async fn transcribe(
             translate,
             temperature_value,
         );
-        let mut state = context
-            .create_state()
-            .map_err(|err| format!("Failed to create whisper state: {err:?}"))?;
-        state
+        wstate
             .full(params, &audio)
             .map_err(|err| format!("Transcription failed: {err:?}"))?;
-        let segments = state
+        let segments = wstate
             .full_n_segments()
             .map_err(|err| format!("Failed to read segments: {err:?}"))?;
         let mut text = String::new();
         for index in 0..segments {
-            let segment = state
+            let segment = wstate
                 .full_get_segment_text(index)
                 .map_err(|err| format!("Failed to read segment text: {err:?}"))?;
             text.push_str(&segment);
         }
-        Ok::<(String, Option<Arc<WhisperContext>>), String>((
+        Ok::<(String, Arc<WhisperContext>, WhisperState), String>((
             text.trim().to_string(),
-            new_context,
+            context,
+            wstate,
         ))
     })
     .await;
 
     let _ = std::fs::remove_file(&temp_path);
 
-    let (text, new_context) = match result {
+    let (text, context, wstate) = match result {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             state.logs.push("error", err.clone()).await;
@@ -2567,11 +2787,12 @@ async fn transcribe(
         }
     };
 
-    if let Some(context) = new_context {
+    {
         let mut cached = state.cached_context.lock().await;
         *cached = Some(CachedWhisperContext {
             model_id: model_id.clone(),
             context,
+            state: wstate,
         });
     }
 
@@ -2621,6 +2842,7 @@ pub fn run() {
                                         tray.queue_len = app_state.dictation.queue_len().await;
                                         drop(tray);
                                         refresh_tray(&app_state).await;
+                                        recompute_and_emit_app_status(&app_state).await;
                                     });
                                 }
                                 ShortcutState::Released => {
@@ -2632,12 +2854,14 @@ pub fn run() {
                                         tray.queue_len = app_state.dictation.queue_len().await;
                                         drop(tray);
                                         refresh_tray(&app_state).await;
+                                        recompute_and_emit_app_status(&app_state).await;
                                         app_state.dictation.process_queue(&app_state, &app_handle).await;
                                         let mut tray = app_state.dictation_tray_state.lock().await;
                                         tray.state = app_state.dictation.current_state().as_str().to_string();
                                         tray.queue_len = app_state.dictation.queue_len().await;
                                         drop(tray);
                                         refresh_tray(&app_state).await;
+                                        recompute_and_emit_app_status(&app_state).await;
                                     });
                                 }
                             }
@@ -2797,6 +3021,14 @@ pub fn run() {
                 });
             }
 
+            // Pre-load the active model so the first transcription is fast
+            {
+                let state_clone = (*state).clone();
+                tauri::async_runtime::spawn(async move {
+                    preload_active_model(&state_clone).await;
+                });
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -2813,6 +3045,7 @@ pub fn run() {
             start_server,
             stop_server,
             get_server_status,
+            get_app_status,
             get_logs,
             clear_logs,
             get_ui_settings,

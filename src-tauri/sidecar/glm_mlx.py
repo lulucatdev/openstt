@@ -16,21 +16,18 @@ def load_model(model_id):
 def run_transcription(model, audio_path):
     from mlx_audio.stt.generate import generate_transcription
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-    tmp.close()
+    tmp_dir = tempfile.mkdtemp()
     try:
         result = generate_transcription(
             model=model,
-            audio_path=audio_path,
-            output_path=tmp.name,
+            audio=audio_path,
+            output_path=os.path.join(tmp_dir, "transcript"),
             format="txt",
             verbose=False,
         )
     finally:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     text = getattr(result, "text", "")
     return text.strip()
 

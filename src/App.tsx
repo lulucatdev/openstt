@@ -370,6 +370,11 @@ const translations = {
     playgroundTranscribing: "Transcribing...",
     playgroundPlaceholder: "Transcription will appear here",
     playgroundRecording: "Recording...",
+    status_stopped: "Stopped",
+    status_loading: "Loading Model",
+    status_ready: "Ready",
+    status_listening: "Listening",
+    status_transcribing: "Transcribing",
   },
   zh: {
     appName: "OpenSTT",
@@ -531,10 +536,18 @@ const translations = {
     playgroundTranscribing: "转写中...",
     playgroundPlaceholder: "转写结果将显示在这里",
     playgroundRecording: "录音中...",
+    status_stopped: "已停止",
+    status_loading: "加载模型中",
+    status_ready: "就绪",
+    status_listening: "录音中",
+    status_transcribing: "转写中",
   },
 } as const;
 
 function App() {
+  const [appStatus, setAppStatus] = useState<
+    "stopped" | "loading" | "ready" | "listening" | "transcribing"
+  >("stopped");
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [cloudUsage, setCloudUsage] = useState<CloudUsage | null>(null);
@@ -587,6 +600,7 @@ function App() {
   const [glmAction, setGlmAction] = useState<
     "install" | "setup" | "reset" | "clear" | null
   >(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [modelAction, setModelAction] = useState<{
@@ -596,6 +610,7 @@ function App() {
   const [downloadProgress, setDownloadProgress] = useState<
     Record<string, number>
   >({});
+  const isAnyDownloading = Object.keys(downloadProgress).length > 0;
   const language = uiSettings.language ?? "en";
   const t = (key: keyof (typeof translations)["en"], params?: Record<string, number | string>) => {
     const template =
@@ -733,6 +748,31 @@ function App() {
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    void (async () => {
+      try {
+        const initial = await invoke<string>("get_app_status");
+        setAppStatus(initial as typeof appStatus);
+      } catch (err) {
+        console.warn("Failed to fetch initial app status:", err);
+      }
+    })();
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      unlisten = await listen<{ status: string }>(
+        "app-status-changed",
+        (event) => {
+          setAppStatus(event.payload.status as typeof appStatus);
+        },
+      );
+    })();
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
   // Window dragging via mousedown on drag regions
   useEffect(() => {
     const appWindow = getCurrentWindow();
@@ -840,12 +880,14 @@ function App() {
   useEffect(() => {
     if (activePage !== "models") {
       setModelsEditing(false);
+      setDeleteConfirmId(null);
     }
   }, [activePage]);
 
   useEffect(() => {
     if (modelsTab === "cloud") {
       setModelsEditing(false);
+      setDeleteConfirmId(null);
     }
   }, [modelsTab]);
 
@@ -1236,9 +1278,15 @@ function App() {
       setError(t("runtimeRequired"));
       return;
     }
+    setDownloadProgress((prev) => ({ ...prev, [modelId]: 0 }));
     try {
       await invoke("download_model", { modelId });
     } catch (err) {
+      setDownloadProgress((prev) => {
+        const next = { ...prev };
+        delete next[modelId];
+        return next;
+      });
       setError(String(err));
     }
   };
@@ -1271,8 +1319,14 @@ function App() {
         await invoke<GlmDependencyStatus>("glm_install_dependencies");
         await refreshGlmDeps();
       }
+      setDownloadProgress((prev) => ({ ...prev, [modelId]: 0 }));
       await invoke("download_model", { modelId });
     } catch (err) {
+      setDownloadProgress((prev) => {
+        const next = { ...prev };
+        delete next[modelId];
+        return next;
+      });
       setError(String(err));
     } finally {
       setGlmAction(null);
@@ -1331,11 +1385,9 @@ function App() {
     }
   };
 
-  const handleDeleteModel = async (modelId: string, name: string) => {
-    if (!window.confirm(t("deleteConfirm", { name }))) {
-      return;
-    }
+  const handleDeleteModel = async (modelId: string) => {
     setError(null);
+    setDeleteConfirmId(null);
     try {
       await invoke("delete_model", { modelId });
       await refreshModels();
@@ -1399,11 +1451,9 @@ function App() {
             </nav>
             <div className="sidebar-footer">
               <div className="sidebar-status">
-                <div
-                  className={`status-pill ${isRunning ? "is-online" : "is-offline"}`}
-                >
+                <div className={`status-pill is-${appStatus}`}>
                   <span className="status-dot" />
-                  {isRunning ? t("running") : t("stopped")}
+                  {t(`status_${appStatus}` as keyof (typeof translations)["en"])}
                 </div>
               </div>
               <div className="sidebar-meta">
@@ -1439,14 +1489,6 @@ function App() {
                 </div>
               </div>
               <div className="content-actions" data-tauri-drag-region="false">
-                {dictationState !== "idle" && (
-                  <div className="dictation-badge">
-                    <span className="dictation-dot" />
-                    {dictationState === "listening"
-                      ? t("dictationListeningBadge")
-                      : t("dictationProcessingBadge")}
-                  </div>
-                )}
                 {activePage === "models" && modelsTab !== "cloud" ? (
                   <button
                     className="button tiny"
@@ -1850,11 +1892,22 @@ function App() {
                                     modelsEditing ? (
                                       isActive ? (
                                         <span className="pill">{t("active")}</span>
+                                      ) : deleteConfirmId === model.id ? (
+                                        <button
+                                          className="button tiny danger"
+                                          onClick={() =>
+                                            handleDeleteModel(model.id)
+                                          }
+                                          disabled={Boolean(modelAction)}
+                                        >
+                                          <Trash2 size={12} strokeWidth={1.6} />
+                                          {t("deleteConfirm", { name: model.name })}
+                                        </button>
                                       ) : (
                                         <button
                                           className="button tiny danger"
                                           onClick={() =>
-                                            handleDeleteModel(model.id, model.name)
+                                            setDeleteConfirmId(model.id)
                                           }
                                           disabled={Boolean(modelAction)}
                                         >
@@ -1884,7 +1937,7 @@ function App() {
                                           : handleDownloadModel(model.id)
                                       }
                                       disabled={
-                                        isDownloading || glmAction === "setup"
+                                        isAnyDownloading || glmAction === "setup"
                                       }
                                     >
                                       {isGlm && !(glmDeps?.ready ?? false)
