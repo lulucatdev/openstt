@@ -54,7 +54,7 @@ struct AppState {
     config_path: Arc<Mutex<Option<PathBuf>>>,
     active_model_id: Arc<Mutex<String>>,
     cached_context: Arc<Mutex<Option<CachedWhisperContext>>>,
-    glm_sidecar: Arc<Mutex<Option<GlmSidecar>>>,
+    mlx_sidecar: Arc<Mutex<Option<MlxSidecar>>>,
     cloud_usage: Arc<Mutex<CloudUsage>>,
     app_handle: Arc<Mutex<Option<tauri::AppHandle>>>,
     tray_snapshot: Arc<Mutex<Option<TraySnapshot>>>,
@@ -76,7 +76,7 @@ struct LogStore {
     log_path: Mutex<Option<PathBuf>>,
 }
 
-struct GlmSidecar {
+struct MlxSidecar {
     model_id: String,
     port: u16,
     child: tokio::process::Child,
@@ -92,7 +92,7 @@ const TRAY_QUIT: &str = "tray-quit";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GlmDependencyStatus {
+struct MlxDependencyStatus {
     supported: bool,
     ready: bool,
     python: Option<String>,
@@ -275,7 +275,7 @@ struct TranscriptionResponse {
 }
 
 #[derive(Deserialize)]
-struct GlmTranscriptionResponse {
+struct MlxTranscriptionResponse {
     text: String,
 }
 
@@ -439,7 +439,7 @@ impl AppState {
             config_path: Arc::new(Mutex::new(None)),
             active_model_id: Arc::new(Mutex::new(default_model_id())),
             cached_context: Arc::new(Mutex::new(None)),
-            glm_sidecar: Arc::new(Mutex::new(None)),
+            mlx_sidecar: Arc::new(Mutex::new(None)),
             cloud_usage: Arc::new(Mutex::new(CloudUsage::default())),
             app_handle: Arc::new(Mutex::new(None)),
             tray_snapshot: Arc::new(Mutex::new(None)),
@@ -918,17 +918,17 @@ fn logs_path() -> PathBuf {
     openstt_dir().join("logs").join("openstt.log")
 }
 
-fn glm_cache_dir() -> PathBuf {
-    models_dir().join("glm").join("cache")
+fn mlx_cache_dir() -> PathBuf {
+    models_dir().join("mlx").join("cache")
 }
 
-fn glm_sidecar_script() -> PathBuf {
-    if let Ok(path) = std::env::var("OPENSTT_GLM_SIDECAR") {
+fn mlx_sidecar_script() -> PathBuf {
+    if let Ok(path) = std::env::var("OPENSTT_MLX_SIDECAR") {
         return PathBuf::from(path);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("sidecar")
-        .join("glm_mlx.py")
+        .join("mlx_stt.py")
 }
 
 fn python_command() -> String {
@@ -959,7 +959,7 @@ fn venv_python_path() -> PathBuf {
     venv_dir().join("bin").join("python3")
 }
 
-fn glm_supported() -> bool {
+fn mlx_supported() -> bool {
     matches!(std::env::consts::ARCH, "aarch64" | "arm64")
         && std::env::consts::OS == "macos"
 }
@@ -1027,9 +1027,9 @@ async fn run_python_check(python: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-async fn glm_dependency_status_inner() -> GlmDependencyStatus {
-    if !glm_supported() {
-        return GlmDependencyStatus {
+async fn mlx_dependency_status_inner() -> MlxDependencyStatus {
+    if !mlx_supported() {
+        return MlxDependencyStatus {
             supported: false,
             ready: false,
             python: None,
@@ -1048,7 +1048,7 @@ async fn glm_dependency_status_inner() -> GlmDependencyStatus {
         false
     };
 
-    GlmDependencyStatus {
+    MlxDependencyStatus {
         supported: true,
         ready: python_ok && mlx_audio,
         python: python_ok.then(|| python),
@@ -1063,13 +1063,13 @@ async fn glm_dependency_status_inner() -> GlmDependencyStatus {
 }
 
 #[tauri::command]
-async fn glm_dependency_status() -> Result<GlmDependencyStatus, String> {
-    Ok(glm_dependency_status_inner().await)
+async fn mlx_dependency_status() -> Result<MlxDependencyStatus, String> {
+    Ok(mlx_dependency_status_inner().await)
 }
 
 #[tauri::command]
-async fn glm_install_dependencies(state: TauriState<'_, AppState>) -> Result<GlmDependencyStatus, String> {
-    if !glm_supported() {
+async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<MlxDependencyStatus, String> {
+    if !mlx_supported() {
         return Err("MLX runtime requires Apple Silicon".to_string());
     }
     let base_python = base_python_command();
@@ -1121,39 +1121,12 @@ async fn glm_install_dependencies(state: TauriState<'_, AppState>) -> Result<Glm
         return Err("Failed to install mlx-audio".to_string());
     }
 
-    Ok(glm_dependency_status_inner().await)
+    Ok(mlx_dependency_status_inner().await)
 }
 
 #[tauri::command]
-async fn glm_clear_cache(state: TauriState<'_, AppState>) -> Result<(), String> {
-    if let Some(mut sidecar) = state.glm_sidecar.lock().await.take() {
-        let _ = sidecar.child.kill().await;
-    }
-    let cache_dir = glm_cache_dir();
-    if cache_dir.exists() {
-        tokio::fs::remove_dir_all(&cache_dir)
-            .await
-            .map_err(|err| format!("Failed to clear cache: {err}"))?;
-        let _ = tokio::fs::create_dir_all(&cache_dir).await;
-    }
-
-    let glm_dir = models_dir().join("glm");
-    if let Ok(mut entries) = tokio::fs::read_dir(&glm_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) == Some("ready") {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-        }
-    }
-
-    state.logs.push("info", "GLM cache cleared").await;
-    Ok(())
-}
-
-#[tauri::command]
-async fn glm_reset_runtime(state: TauriState<'_, AppState>) -> Result<(), String> {
-    if let Some(mut sidecar) = state.glm_sidecar.lock().await.take() {
+async fn mlx_reset_runtime(state: TauriState<'_, AppState>) -> Result<(), String> {
+    if let Some(mut sidecar) = state.mlx_sidecar.lock().await.take() {
         let _ = sidecar.child.kill().await;
     }
     let venv = venv_dir();
@@ -1162,7 +1135,62 @@ async fn glm_reset_runtime(state: TauriState<'_, AppState>) -> Result<(), String
             .await
             .map_err(|err| format!("Failed to remove venv: {err}"))?;
     }
-    state.logs.push("info", "GLM runtime reset").await;
+    state.logs.push("info", "MLX runtime reset").await;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyModelsInfo {
+    found: bool,
+    path: String,
+    size_bytes: u64,
+}
+
+#[tauri::command]
+async fn check_legacy_models() -> Result<LegacyModelsInfo, String> {
+    let legacy_dir = models_dir().join("glm");
+    if !legacy_dir.exists() {
+        return Ok(LegacyModelsInfo {
+            found: false,
+            path: legacy_dir.to_string_lossy().to_string(),
+            size_bytes: 0,
+        });
+    }
+    let mut total: u64 = 0;
+    let mut stack = vec![legacy_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|err| format!("Failed to read directory: {err}"))?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let meta = entry
+                .metadata()
+                .await
+                .map_err(|err| format!("Failed to read metadata: {err}"))?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(LegacyModelsInfo {
+        found: true,
+        path: legacy_dir.to_string_lossy().to_string(),
+        size_bytes: total,
+    })
+}
+
+#[tauri::command]
+async fn clean_legacy_models(state: TauriState<'_, AppState>) -> Result<(), String> {
+    let legacy_dir = models_dir().join("glm");
+    if legacy_dir.exists() {
+        tokio::fs::remove_dir_all(&legacy_dir)
+            .await
+            .map_err(|err| format!("Failed to remove legacy models: {err}"))?;
+    }
+    state.logs.push("info", "Legacy models cleaned").await;
     Ok(())
 }
 
@@ -1204,12 +1232,12 @@ fn save_app_config(path: &Path, config: &AppConfig) -> Result<(), String> {
     std::fs::write(path, payload).map_err(|err| format!("Failed to save config: {err}"))
 }
 
-async fn prepare_glm_model(
+async fn prepare_mlx_model(
     state: &AppState,
     models_root: &Path,
     entry: models::CatalogEntry,
 ) -> Result<(), String> {
-    let deps = glm_dependency_status_inner().await;
+    let deps = mlx_dependency_status_inner().await;
     if !deps.ready {
         return Err(deps
             .message
@@ -1224,9 +1252,9 @@ async fn prepare_glm_model(
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create model directory: {err}"))?;
     }
-    let script = glm_sidecar_script();
+    let script = mlx_sidecar_script();
     if !script.exists() {
-        return Err("GLM sidecar script not found".to_string());
+        return Err("MLX sidecar script not found".to_string());
     }
 
     state
@@ -1234,21 +1262,25 @@ async fn prepare_glm_model(
         .push("info", format!("Preparing model {}...", entry.id))
         .await;
 
+    emit_download_progress_async(state, entry.id, 0, false, None).await;
+
     let output = Command::new(python_command())
         .arg(script)
         .arg("--model")
         .arg(entry.download_url)
         .arg("--preload")
-        .env("HF_HOME", glm_cache_dir())
+        .env("HF_HOME", mlx_cache_dir())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|err| format!("Failed to run GLM preload: {err}"))?;
+        .map_err(|err| format!("Failed to run MLX preload: {err}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("GLM preload failed: {stderr}"));
+        let msg = format!("MLX preload failed: {stderr}");
+        emit_download_progress_async(state, entry.id, 0, true, Some(msg.clone())).await;
+        return Err(msg);
     }
 
     tokio::fs::write(&marker, b"ready")
@@ -1259,10 +1291,11 @@ async fn prepare_glm_model(
         .logs
         .push("info", format!("Model {} ready", entry.id))
         .await;
+    emit_download_progress_async(state, entry.id, 100, true, None).await;
     Ok(())
 }
 
-async fn glm_health(port: u16) -> bool {
+async fn mlx_health(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
@@ -1278,29 +1311,29 @@ async fn glm_health(port: u16) -> bool {
     false
 }
 
-async fn ensure_glm_sidecar(state: &AppState, model_id: &str) -> Result<u16, String> {
+async fn ensure_mlx_sidecar(state: &AppState, model_id: &str) -> Result<u16, String> {
     let existing = {
-        let guard = state.glm_sidecar.lock().await;
+        let guard = state.mlx_sidecar.lock().await;
         guard.as_ref().map(|sidecar| (sidecar.model_id.clone(), sidecar.port))
     };
 
     if let Some((existing_model, existing_port)) = existing {
-        if existing_model == model_id && glm_health(existing_port).await {
+        if existing_model == model_id && mlx_health(existing_port).await {
             return Ok(existing_port);
         }
     }
 
-    if let Some(mut old) = state.glm_sidecar.lock().await.take() {
+    if let Some(mut old) = state.mlx_sidecar.lock().await.take() {
         let _ = old.child.kill().await;
     }
 
-    let port = std::env::var("OPENSTT_GLM_PORT")
+    let port = std::env::var("OPENSTT_MLX_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(8791);
-    let script = glm_sidecar_script();
+    let script = mlx_sidecar_script();
     if !script.exists() {
-        return Err("GLM sidecar script not found".to_string());
+        return Err("MLX sidecar script not found".to_string());
     }
 
     let child = Command::new(python_command())
@@ -1309,17 +1342,17 @@ async fn ensure_glm_sidecar(state: &AppState, model_id: &str) -> Result<u16, Str
         .arg(model_id)
         .arg("--port")
         .arg(port.to_string())
-        .env("HF_HOME", glm_cache_dir())
+        .env("HF_HOME", mlx_cache_dir())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("Failed to start GLM sidecar: {err}"))?;
+        .map_err(|err| format!("Failed to start MLX sidecar: {err}"))?;
 
     let mut attempts = 0;
     while attempts < 20 {
-        if glm_health(port).await {
-            let mut guard = state.glm_sidecar.lock().await;
-            *guard = Some(GlmSidecar {
+        if mlx_health(port).await {
+            let mut guard = state.mlx_sidecar.lock().await;
+            *guard = Some(MlxSidecar {
                 model_id: model_id.to_string(),
                 port,
                 child,
@@ -1335,15 +1368,15 @@ async fn ensure_glm_sidecar(state: &AppState, model_id: &str) -> Result<u16, Str
         .await
         .map(|output| String::from_utf8_lossy(&output.stderr).to_string())
         .unwrap_or_else(|_| "".to_string());
-    Err(format!("GLM sidecar failed to start. {stderr}"))
+    Err(format!("MLX sidecar failed to start. {stderr}"))
 }
 
-async fn glm_transcribe(
+async fn mlx_transcribe(
     state: &AppState,
     model_id: &str,
     audio_path: &Path,
 ) -> Result<String, String> {
-    let port = ensure_glm_sidecar(state, model_id).await?;
+    let port = ensure_mlx_sidecar(state, model_id).await?;
     let url = format!("http://127.0.0.1:{port}/transcribe");
     let payload = serde_json::json!({
         "audio_path": audio_path.to_string_lossy().to_string()
@@ -1353,15 +1386,15 @@ async fn glm_transcribe(
         .json(&payload)
         .send()
         .await
-        .map_err(|err| format!("GLM sidecar request failed: {err}"))?;
+        .map_err(|err| format!("MLX sidecar request failed: {err}"))?;
     if !response.status().is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(format!("GLM sidecar error: {body}"));
+        return Err(format!("MLX sidecar error: {body}"));
     }
     let payload = response
-        .json::<GlmTranscriptionResponse>()
+        .json::<MlxTranscriptionResponse>()
         .await
-        .map_err(|err| format!("GLM response parse failed: {err}"))?;
+        .map_err(|err| format!("MLX response parse failed: {err}"))?;
     Ok(payload.text)
 }
 
@@ -1596,7 +1629,7 @@ pub(crate) async fn transcribe_bytes(
         return Err(TranscribeError::internal(message));
     }
 
-    if entry.engine == models::ModelEngine::GlmMlx {
+    if entry.engine == models::ModelEngine::Mlx {
         let dir = match resolve_models_dir(state).await {
             Ok(dir) => dir,
             Err(err) => {
@@ -1626,7 +1659,7 @@ pub(crate) async fn transcribe_bytes(
             }
         }
 
-        let text = match glm_transcribe(state, entry.download_url, &temp_path).await {
+        let text = match mlx_transcribe(state, entry.download_url, &temp_path).await {
             Ok(text) => text,
             Err(err) => {
                 state.logs.push("error", err.clone()).await;
@@ -1757,7 +1790,7 @@ async fn resolve_models_dir(state: &AppState) -> Result<PathBuf, String> {
 
 fn hf_cache_dir_for(model_id: &str) -> PathBuf {
     let folder = model_id.replace('/', "--");
-    glm_cache_dir().join("hub").join(format!("models--{folder}"))
+    mlx_cache_dir().join("hub").join(format!("models--{folder}"))
 }
 
 async fn build_status(state: &AppState) -> ServerStatus {
@@ -2126,7 +2159,7 @@ async fn delete_model(state: TauriState<'_, AppState>, model_id: String) -> Resu
     }
     let path = models::model_path(&dir, &model_id)
         .ok_or_else(|| format!("Unknown model: {model_id}"))?;
-    if entry.engine == models::ModelEngine::GlmMlx {
+    if entry.engine == models::ModelEngine::Mlx {
         if path.exists() {
             tokio::fs::remove_file(&path)
                 .await
@@ -2224,8 +2257,8 @@ async fn download_model_inner(
             .find(|info| info.id == model_id)
             .ok_or_else(|| "Model info unavailable".to_string());
     }
-    if entry.engine == models::ModelEngine::GlmMlx {
-        prepare_glm_model(state, &dir, entry).await?;
+    if entry.engine == models::ModelEngine::Mlx {
+        prepare_mlx_model(state, &dir, entry).await?;
         let models = models::list_models(&dir);
         return models
             .into_iter()
@@ -2408,17 +2441,17 @@ async fn preload_whisper_model(state: &AppState) {
     }
 }
 
-async fn preload_glm_model(state: &AppState) {
+async fn preload_mlx_model(state: &AppState) {
     let model_id = state.active_model_id.lock().await.clone();
     let entry = match models::model_entry(&model_id) {
-        Some(e) if e.engine == models::ModelEngine::GlmMlx => e,
+        Some(e) if e.engine == models::ModelEngine::Mlx => e,
         _ => return,
     };
     // Check if sidecar is already running for this model
     {
-        let guard = state.glm_sidecar.lock().await;
+        let guard = state.mlx_sidecar.lock().await;
         if let Some(sidecar) = guard.as_ref() {
-            if sidecar.model_id == model_id && glm_health(sidecar.port).await {
+            if sidecar.model_id == model_id && mlx_health(sidecar.port).await {
                 return;
             }
         }
@@ -2426,16 +2459,16 @@ async fn preload_glm_model(state: &AppState) {
     emit_app_status(state, AppStatus::Loading).await;
     state
         .logs
-        .push("info", format!("Pre-loading GLM model {model_id}…"))
+        .push("info", format!("Pre-loading MLX model {model_id}…"))
         .await;
-    match ensure_glm_sidecar(state, entry.download_url).await {
+    match ensure_mlx_sidecar(state, entry.download_url).await {
         Ok(port) => state
             .logs
-            .push("info", format!("GLM sidecar ready on port {port}"))
+            .push("info", format!("MLX sidecar ready on port {port}"))
             .await,
         Err(err) => state
             .logs
-            .push("error", format!("GLM pre-load failed: {err}"))
+            .push("error", format!("MLX pre-load failed: {err}"))
             .await,
     }
 }
@@ -2445,7 +2478,7 @@ async fn preload_active_model(state: &AppState) {
     let model_id = state.active_model_id.lock().await.clone();
     match models::model_entry(&model_id).map(|e| e.engine) {
         Some(models::ModelEngine::Whisper) => preload_whisper_model(state).await,
-        Some(models::ModelEngine::GlmMlx) => preload_glm_model(state).await,
+        Some(models::ModelEngine::Mlx) => preload_mlx_model(state).await,
         _ => {} // Cloud models don't need preloading
     }
     recompute_and_emit_app_status(state).await;
@@ -2646,7 +2679,7 @@ async fn transcribe(
         return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
 
-    if entry.engine == models::ModelEngine::GlmMlx {
+    if entry.engine == models::ModelEngine::Mlx {
         let dir = match resolve_models_dir(&state).await {
             Ok(dir) => dir,
             Err(err) => {
@@ -2676,7 +2709,7 @@ async fn transcribe(
             }
         }
 
-        let text = match glm_transcribe(&state, entry.download_url, &temp_path).await {
+        let text = match mlx_transcribe(&state, entry.download_url, &temp_path).await {
             Ok(text) => text,
             Err(err) => {
                 state.logs.push("error", err.clone()).await;
@@ -2931,9 +2964,9 @@ pub fn run() {
             let model_dir = models_dir();
             let _ = std::fs::create_dir_all(&model_dir);
             let _ = std::fs::create_dir_all(model_dir.join("whisper"));
-            let _ = std::fs::create_dir_all(model_dir.join("glm"));
+            let _ = std::fs::create_dir_all(model_dir.join("mlx"));
             let _ = std::fs::create_dir_all(model_dir.join("cloud"));
-            let _ = std::fs::create_dir_all(glm_cache_dir());
+            let _ = std::fs::create_dir_all(mlx_cache_dir());
             {
                 let mut model_guard = state.models_dir.blocking_lock();
                 *model_guard = Some(model_dir);
@@ -3062,12 +3095,13 @@ pub fn run() {
             list_models,
             download_model,
             delete_model,
-            glm_dependency_status,
-            glm_install_dependencies,
-            glm_clear_cache,
-            glm_reset_runtime,
+            mlx_dependency_status,
+            mlx_install_dependencies,
+            mlx_reset_runtime,
             get_active_model,
-            set_active_model
+            set_active_model,
+            check_legacy_models,
+            clean_legacy_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -88,13 +88,19 @@ type DownloadProgressEvent = {
   error: string | null;
 };
 
-type GlmDependencyStatus = {
+type MlxDependencyStatus = {
   supported: boolean;
   ready: boolean;
   python: string | null;
   venv: boolean;
   mlxAudio: boolean;
   message?: string | null;
+};
+
+type LegacyModelsInfo = {
+  found: boolean;
+  path: string;
+  sizeBytes: number;
 };
 
 type LogEntry = {
@@ -288,8 +294,6 @@ const translations = {
     runtimeInstalling: "Installing...",
     runtimeReset: "Reset runtime",
     runtimeResetting: "Resetting...",
-    runtimeClearCache: "Clear cache",
-    runtimeClearing: "Clearing...",
     runtimeRequired: "Install MLX runtime before downloading this model.",
     setup: "Set up",
     settingUp: "Setting up...",
@@ -298,7 +302,9 @@ const translations = {
     localModels: "Local Models",
     cloudModels: "Cloud Models",
     whisperModels: "Whisper Models",
-    pythonModels: "Python Models",
+    mlxModels: "MLX Models",
+    mlxRecommendation: "MLX models run faster on Apple Silicon. Switch to MLX Models tab for better performance.",
+    switchToMlx: "Switch to MLX",
     cloudSettings: "Cloud",
     apiKey: "API Key",
     apiKeyHint: "Stored locally in ~/.openstt/settings.json",
@@ -389,6 +395,12 @@ const translations = {
     status_ready: "Ready",
     status_listening: "Listening",
     status_transcribing: "Transcribing",
+    legacyTitle: "Legacy Cleanup",
+    legacyDesc: "Remove old model files from previous versions",
+    legacyFound: "Found {size} of legacy files",
+    legacyNotFound: "No legacy files found",
+    legacyClean: "Clean up",
+    legacyCleaning: "Cleaning...",
   },
   zh: {
     appName: "OpenSTT",
@@ -459,8 +471,6 @@ const translations = {
     runtimeInstalling: "安装中...",
     runtimeReset: "重置运行时",
     runtimeResetting: "重置中...",
-    runtimeClearCache: "清理缓存",
-    runtimeClearing: "清理中...",
     runtimeRequired: "请先安装 MLX 运行时再下载该模型。",
     setup: "配置",
     settingUp: "配置中...",
@@ -469,7 +479,9 @@ const translations = {
     localModels: "本地模型",
     cloudModels: "云端模型",
     whisperModels: "Whisper 模型",
-    pythonModels: "Python 模型",
+    mlxModels: "MLX 模型",
+    mlxRecommendation: "MLX 模型在 Apple Silicon 上运行更快。切换到 MLX 模型以获得更好的性能。",
+    switchToMlx: "切换到 MLX",
     cloudSettings: "云端",
     apiKey: "API Key",
     apiKeyHint: "本地保存于 ~/.openstt/settings.json",
@@ -560,6 +572,12 @@ const translations = {
     status_ready: "就绪",
     status_listening: "录音中",
     status_transcribing: "转写中",
+    legacyTitle: "历史遗留清理",
+    legacyDesc: "删除旧版本遗留的模型文件",
+    legacyFound: "发现 {size} 遗留文件",
+    legacyNotFound: "未发现遗留文件",
+    legacyClean: "清理",
+    legacyCleaning: "清理中...",
   },
 } as const;
 
@@ -612,13 +630,15 @@ function App() {
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
-  const [modelsTab, setModelsTab] = useState<"whisper" | "python" | "cloud">(
-    "whisper",
+  const [modelsTab, setModelsTab] = useState<"whisper" | "mlx-local" | "cloud">(
+    "mlx-local",
   );
-  const [glmDeps, setGlmDeps] = useState<GlmDependencyStatus | null>(null);
-  const [glmAction, setGlmAction] = useState<
-    "install" | "setup" | "reset" | "clear" | null
+  const [mlxDeps, setMlxDeps] = useState<MlxDependencyStatus | null>(null);
+  const [mlxAction, setMlxAction] = useState<
+    "install" | "setup" | "reset" | null
   >(null);
+  const [legacyModels, setLegacyModels] = useState<LegacyModelsInfo | null>(null);
+  const [legacyAction, setLegacyAction] = useState<"cleaning" | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
@@ -718,18 +738,33 @@ function App() {
         invoke<string>("get_active_model"),
       ]);
       setModels(list);
-      setActiveModelId(active);
+      const activeModel = list.find((m) => m.id === active);
+      if (activeModel && !activeModel.downloaded && activeModel.engine !== "cloud") {
+        const fallback = list.find((m) => m.downloaded && m.engine !== "cloud");
+        if (fallback) {
+          try {
+            const next = await invoke<string>("set_active_model", { modelId: fallback.id });
+            setActiveModelId(next);
+          } catch {
+            setActiveModelId(active);
+          }
+        } else {
+          setActiveModelId(active);
+        }
+      } else {
+        setActiveModelId(active);
+      }
     } catch (err) {
       setError(String(err));
     }
   };
 
-  const refreshGlmDeps = async () => {
+  const refreshMlxDeps = async () => {
     try {
-      const status = await invoke<GlmDependencyStatus>(
-        "glm_dependency_status",
+      const status = await invoke<MlxDependencyStatus>(
+        "mlx_dependency_status",
       );
-      setGlmDeps(status);
+      setMlxDeps(status);
     } catch (err) {
       setError(String(err));
     }
@@ -740,7 +775,8 @@ function App() {
     void refreshLogs();
     void refreshCloudUsage();
     void refreshModels();
-    void refreshGlmDeps();
+    void refreshMlxDeps();
+    void invoke<LegacyModelsInfo>("check_legacy_models").then(setLegacyModels).catch(() => {});
     void (async () => {
       try {
         const settings = await invoke<UiSettings>("get_ui_settings");
@@ -819,12 +855,19 @@ function App() {
 
   const currentPage =
     pages.find((page) => page.id === activePage) ?? pages[0];
-  const glmSupported = glmDeps?.supported ?? true;
-  const glmReady = glmDeps?.ready ?? false;
+  const mlxSupported = mlxDeps?.supported ?? true;
+  const mlxReady = mlxDeps?.ready ?? false;
+
+  // Fall back to whisper tab if MLX is confirmed unsupported
+  useEffect(() => {
+    if (mlxDeps && !mlxDeps.supported && modelsTab === "mlx-local") {
+      setModelsTab("whisper");
+    }
+  }, [mlxDeps, modelsTab]);
   const logsStreaming =
-    activePage === "logs" || glmAction === "install" || glmAction === "setup";
+    activePage === "logs" || mlxAction === "install" || mlxAction === "setup";
   const whisperModels = models.filter((model) => model.engine === "whisper");
-  const pythonModels = models.filter(
+  const mlxLocalModels = models.filter(
     (model) => model.engine !== "whisper" && model.engine !== "cloud",
   );
   const cloudModels = models.filter((model) => model.engine === "cloud");
@@ -1287,7 +1330,7 @@ function App() {
         return;
       }
     }
-    if (model?.engine === "glm-mlx" && !(glmDeps?.ready ?? false)) {
+    if (model?.engine === "mlx" && !(mlxDeps?.ready ?? false)) {
       setError(t("runtimeRequired"));
       return;
     }
@@ -1304,33 +1347,33 @@ function App() {
     }
   };
 
-  const handleInstallGlm = async () => {
+  const handleInstallMlx = async () => {
     setError(null);
-    setGlmAction("install");
+    setMlxAction("install");
     try {
-      const status = await invoke<GlmDependencyStatus>(
-        "glm_install_dependencies",
+      const status = await invoke<MlxDependencyStatus>(
+        "mlx_install_dependencies",
       );
-      setGlmDeps(status);
+      setMlxDeps(status);
     } catch (err) {
       setError(String(err));
     } finally {
-      setGlmAction(null);
-      void refreshGlmDeps();
+      setMlxAction(null);
+      void refreshMlxDeps();
     }
   };
 
-  const handleSetupGlmModel = async (modelId: string) => {
-    if (glmDeps && !glmDeps.supported) {
+  const handleSetupMlxModel = async (modelId: string) => {
+    if (mlxDeps && !mlxDeps.supported) {
       setError(t("runtimeUnsupported"));
       return;
     }
     setError(null);
-    setGlmAction("setup");
+    setMlxAction("setup");
     try {
-      if (!(glmDeps?.ready ?? false)) {
-        await invoke<GlmDependencyStatus>("glm_install_dependencies");
-        await refreshGlmDeps();
+      if (!(mlxDeps?.ready ?? false)) {
+        await invoke<MlxDependencyStatus>("mlx_install_dependencies");
+        await refreshMlxDeps();
       }
       setDownloadProgress((prev) => ({ ...prev, [modelId]: 0 }));
       await invoke("download_model", { modelId });
@@ -1342,33 +1385,20 @@ function App() {
       });
       setError(String(err));
     } finally {
-      setGlmAction(null);
+      setMlxAction(null);
     }
   };
 
-  const handleResetGlmRuntime = async () => {
+  const handleResetMlxRuntime = async () => {
     setError(null);
-    setGlmAction("reset");
+    setMlxAction("reset");
     try {
-      await invoke("glm_reset_runtime");
-      await refreshGlmDeps();
+      await invoke("mlx_reset_runtime");
+      await refreshMlxDeps();
     } catch (err) {
       setError(String(err));
     } finally {
-      setGlmAction(null);
-    }
-  };
-
-  const handleClearGlmCache = async () => {
-    setError(null);
-    setGlmAction("clear");
-    try {
-      await invoke("glm_clear_cache");
-      await refreshModels();
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setGlmAction(null);
+      setMlxAction(null);
     }
   };
 
@@ -1842,6 +1872,16 @@ function App() {
                 </div>
 
                 <div className="model-tabs">
+                  {mlxSupported && (
+                    <button
+                      className={`model-tab ${
+                        modelsTab === "mlx-local" ? "is-active" : ""
+                      }`}
+                      onClick={() => setModelsTab("mlx-local")}
+                    >
+                      {t("mlxModels")}
+                    </button>
+                  )}
                   <button
                     className={`model-tab ${
                       modelsTab === "whisper" ? "is-active" : ""
@@ -1849,14 +1889,6 @@ function App() {
                     onClick={() => setModelsTab("whisper")}
                   >
                     {t("whisperModels")}
-                  </button>
-                  <button
-                    className={`model-tab ${
-                      modelsTab === "python" ? "is-active" : ""
-                    }`}
-                    onClick={() => setModelsTab("python")}
-                  >
-                    {t("pythonModels")}
                   </button>
                   <button
                     className={`model-tab ${
@@ -1906,7 +1938,7 @@ function App() {
                   </div>
                 )}
 
-                {modelsTab === "python" && pythonModels.length > 0 && (
+                {modelsTab === "mlx-local" && mlxLocalModels.length > 0 && (
                   <div className="runtime-row">
                     <div>
                       <div className="runtime-title">{t("runtimeTitle")}</div>
@@ -1915,31 +1947,31 @@ function App() {
                     <div className="runtime-actions">
                       <span
                         className={`runtime-status ${
-                          glmReady
+                          mlxReady
                             ? "is-ready"
-                            : glmSupported
+                            : mlxSupported
                               ? "is-missing"
                               : "is-unsupported"
                         }`}
                       >
-                        {glmReady
+                        {mlxReady
                           ? t("runtimeReady")
-                          : glmSupported
+                          : mlxSupported
                             ? t("runtimeMissing")
                             : t("runtimeUnsupported")}
                       </span>
-                      {!glmReady && glmSupported && (
+                      {!mlxReady && mlxSupported && (
                         <button
                           className="button tiny"
-                          onClick={handleInstallGlm}
-                          disabled={glmAction === "install"}
+                          onClick={handleInstallMlx}
+                          disabled={mlxAction === "install"}
                         >
-                          {glmAction === "install"
+                          {mlxAction === "install"
                             ? t("runtimeInstalling")
                             : t("runtimeInstall")}
                         </button>
                       )}
-                      {(glmAction === "install" || glmAction === "setup") && (
+                      {(mlxAction === "install" || mlxAction === "setup") && (
                         <button
                           className="button tiny ghost"
                           onClick={() => setActivePage("logs")}
@@ -2014,14 +2046,25 @@ function App() {
                     <div className="section-title">
                       {modelsTab === "whisper"
                         ? t("whisperModels")
-                        : t("pythonModels")}
+                        : t("mlxModels")}
                     </div>
+                    {modelsTab === "whisper" && mlxSupported && (
+                      <div className="runtime-row" style={{ marginBottom: 12 }}>
+                        <div className="muted">{t("mlxRecommendation")}</div>
+                        <button
+                          className="button tiny"
+                          onClick={() => setModelsTab("mlx-local")}
+                        >
+                          {t("switchToMlx")}
+                        </button>
+                      </div>
+                    )}
                     <div className="model-list">
-                      {(modelsTab === "whisper" ? whisperModels : pythonModels)
+                      {(modelsTab === "whisper" ? whisperModels : mlxLocalModels)
                         .length === 0 ? (
                         <div className="empty">{t("noModels")}</div>
                       ) : (
-                        (modelsTab === "whisper" ? whisperModels : pythonModels).map(
+                        (modelsTab === "whisper" ? whisperModels : mlxLocalModels).map(
                           (model) => {
                             const isActive = model.id === activeModelId;
                             const dlPercent = downloadProgress[model.id];
@@ -2029,7 +2072,7 @@ function App() {
                             const isActivating =
                               modelAction?.id === model.id &&
                               modelAction.type === "activate";
-                            const isGlm = model.engine === "glm-mlx";
+                            const isMlx = model.engine === "mlx";
                             return (
                               <div
                                 key={model.id}
@@ -2091,20 +2134,22 @@ function App() {
                                     <button
                                       className="button tiny"
                                       onClick={() =>
-                                        isGlm && !(glmDeps?.ready ?? false)
-                                          ? handleSetupGlmModel(model.id)
+                                        isMlx && !(mlxDeps?.ready ?? false)
+                                          ? handleSetupMlxModel(model.id)
                                           : handleDownloadModel(model.id)
                                       }
                                       disabled={
-                                        isAnyDownloading || glmAction === "setup"
+                                        isAnyDownloading || mlxAction === "setup"
                                       }
                                     >
-                                      {isGlm && !(glmDeps?.ready ?? false)
-                                        ? glmAction === "setup"
+                                      {isMlx && !(mlxDeps?.ready ?? false)
+                                        ? mlxAction === "setup"
                                           ? t("settingUp")
                                           : t("setup")
                                         : isDownloading
-                                          ? `${dlPercent}%`
+                                          ? isMlx
+                                            ? t("downloading")
+                                            : `${dlPercent}%`
                                           : t("download")}
                                     </button>
                                   )}
@@ -2416,11 +2461,11 @@ function App() {
                         <div className="settings-hint">{t("runtimeDesc")}</div>
                       </div>
                       <span
-                        className={`status-chip ${glmReady ? "is-online" : ""}`}
+                        className={`status-chip ${mlxReady ? "is-online" : ""}`}
                       >
-                        {glmReady
+                        {mlxReady
                           ? t("runtimeReady")
-                          : glmSupported
+                          : mlxSupported
                             ? t("runtimeMissing")
                             : t("runtimeUnsupported")}
                       </span>
@@ -2429,15 +2474,15 @@ function App() {
                       <div>
                         <div className="settings-label">{t("runtimeInstall")}</div>
                         <div className="settings-hint">
-                          {glmDeps?.python ?? "python3"}
+                          {mlxDeps?.python ?? "python3"}
                         </div>
                       </div>
                       <button
                         className="button tiny"
-                        onClick={handleInstallGlm}
-                        disabled={glmAction === "install" || !glmSupported}
+                        onClick={handleInstallMlx}
+                        disabled={mlxAction === "install" || !mlxSupported || mlxReady}
                       >
-                        {glmAction === "install"
+                        {mlxAction === "install"
                           ? t("runtimeInstalling")
                           : t("runtimeInstall")}
                       </button>
@@ -2449,29 +2494,47 @@ function App() {
                       </div>
                       <button
                         className="button tiny"
-                        onClick={handleResetGlmRuntime}
-                        disabled={glmAction === "reset" || !glmSupported}
+                        onClick={handleResetMlxRuntime}
+                        disabled={mlxAction === "reset" || !mlxSupported}
                       >
-                        {glmAction === "reset"
+                        {mlxAction === "reset"
                           ? t("runtimeResetting")
                           : t("runtimeReset")}
                       </button>
                     </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("runtimeClearCache")}</div>
-                        <div className="settings-hint">~/.openstt/models/glm/cache</div>
+                    {legacyModels?.found && (
+                      <div className="settings-row">
+                        <div>
+                          <div className="settings-label">{t("legacyTitle")}</div>
+                          <div className="settings-hint">
+                            {t("legacyFound", {
+                              size: legacyModels.sizeBytes >= 1073741824
+                                ? `${(legacyModels.sizeBytes / 1073741824).toFixed(1)} GB`
+                                : `${Math.round(legacyModels.sizeBytes / 1048576)} MB`,
+                            })}
+                          </div>
+                        </div>
+                        <button
+                          className="button tiny"
+                          onClick={async () => {
+                            setLegacyAction("cleaning");
+                            try {
+                              await invoke("clean_legacy_models");
+                              setLegacyModels({ found: false, path: legacyModels.path, sizeBytes: 0 });
+                            } catch (err) {
+                              setError(String(err));
+                            } finally {
+                              setLegacyAction(null);
+                            }
+                          }}
+                          disabled={legacyAction === "cleaning"}
+                        >
+                          {legacyAction === "cleaning"
+                            ? t("legacyCleaning")
+                            : t("legacyClean")}
+                        </button>
                       </div>
-                      <button
-                        className="button tiny"
-                        onClick={handleClearGlmCache}
-                        disabled={glmAction === "clear" || !glmSupported}
-                      >
-                        {glmAction === "clear"
-                          ? t("runtimeClearing")
-                          : t("runtimeClearCache")}
-                      </button>
-                    </div>
+                    )}
                   </div>
                 </div>
 
