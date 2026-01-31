@@ -4,6 +4,7 @@ import {
   FileText,
   LayoutDashboard,
   Menu,
+  Mic,
   Settings,
   Trash2,
   X,
@@ -399,6 +400,13 @@ const translations = {
     aboutDesc: "Local speech to text gateway",
     build: "Build",
     portHint: "Port must be 1-65535",
+    pagePlayground: "Playground",
+    pagePlaygroundDesc: "Record and transcribe",
+    playgroundRecord: "Record",
+    playgroundStop: "Stop & Transcribe",
+    playgroundTranscribing: "Transcribing...",
+    playgroundPlaceholder: "Transcription will appear here",
+    playgroundRecording: "Recording...",
   },
   zh: {
     appName: "OpenSTT",
@@ -553,6 +561,13 @@ const translations = {
     aboutDesc: "本地语音转文字网关",
     build: "版本",
     portHint: "端口必须在 1-65535 之间",
+    pagePlayground: "试听",
+    pagePlaygroundDesc: "录音并转写",
+    playgroundRecord: "录音",
+    playgroundStop: "停止并转写",
+    playgroundTranscribing: "转写中...",
+    playgroundPlaceholder: "转写结果将显示在这里",
+    playgroundRecording: "录音中...",
   },
 } as const;
 
@@ -597,8 +612,13 @@ function App() {
   const dictationQueueRef = useRef<Uint8Array[]>([]);
   const dictationListeningRef = useRef(false);
   const dictationProcessingRef = useRef(false);
+  const [playgroundStatus, setPlaygroundStatus] = useState<
+    "idle" | "recording" | "transcribing"
+  >("idle");
+  const [playgroundText, setPlaygroundText] = useState("");
+  const playgroundRecorderRef = useRef<DictationRecorder | null>(null);
   const [activePage, setActivePage] = useState<
-    "overview" | "models" | "logs" | "settings"
+    "overview" | "models" | "logs" | "settings" | "playground"
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
@@ -644,6 +664,12 @@ function App() {
       label: t("pageLogs"),
       description: t("pageLogsDesc"),
       icon: FileText,
+    },
+    {
+      id: "playground",
+      label: t("pagePlayground"),
+      description: t("pagePlaygroundDesc"),
+      icon: Mic,
     },
     {
       id: "settings",
@@ -903,7 +929,8 @@ function App() {
           page === "overview" ||
           page === "models" ||
           page === "logs" ||
-          page === "settings"
+          page === "settings" ||
+          page === "playground"
         ) {
           setActivePage(page);
           setDrawerOpen(false);
@@ -1220,6 +1247,87 @@ function App() {
     dictationQueueRef.current.push(wavBytes);
     syncDictationQueueCount();
     void processDictationQueue();
+  };
+
+  const startPlaygroundRecording = async () => {
+    if (playgroundStatus === "recording") {
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const context = new AudioContext();
+      await context.resume();
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const chunks: Float32Array[] = [];
+      processor.onaudioprocess = (event) => {
+        if (playgroundRecorderRef.current) {
+          const input = event.inputBuffer.getChannelData(0);
+          chunks.push(new Float32Array(input));
+        }
+      };
+      source.connect(processor);
+      processor.connect(context.destination);
+      playgroundRecorderRef.current = {
+        context,
+        source,
+        processor,
+        stream,
+        chunks,
+      };
+      setPlaygroundStatus("recording");
+    } catch (err) {
+      const errStr = String(err);
+      if (
+        errStr.includes("NotAllowedError") ||
+        errStr.includes("not allowed") ||
+        errStr.includes("denied permission")
+      ) {
+        setPermissionError("microphone");
+      } else {
+        setError(errStr);
+      }
+    }
+  };
+
+  const stopPlaygroundAndTranscribe = async () => {
+    const recorder = playgroundRecorderRef.current;
+    if (!recorder) {
+      setPlaygroundStatus("idle");
+      return;
+    }
+    const { context, source, processor, stream, chunks } = recorder;
+    processor.disconnect();
+    source.disconnect();
+    processor.onaudioprocess = null;
+    stream.getTracks().forEach((track) => track.stop());
+    const sampleRate = context.sampleRate;
+    await context.close();
+    playgroundRecorderRef.current = null;
+    const merged = mergeFloat32(chunks);
+    if (merged.length < sampleRate * 0.15) {
+      setPlaygroundStatus("idle");
+      return;
+    }
+    const wav = encodeWav(merged, sampleRate);
+    setPlaygroundStatus("transcribing");
+    try {
+      const text = await invoke<string>("transcribe_audio", {
+        request: {
+          bytes: Array.from(wav),
+          fileName: "playground.wav",
+          modelId: activeModelId ?? "base",
+        },
+      });
+      const trimmed = text.trim();
+      if (trimmed) {
+        setPlaygroundText((prev) => (prev ? prev + "\n" + trimmed : trimmed));
+      }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setPlaygroundStatus("idle");
+    }
   };
 
   const buildDictationShortcut = (event: KeyboardEvent) => {
@@ -2030,6 +2138,42 @@ function App() {
                       </div>
                     ))
                   )}
+                </div>
+              </div>
+            )}
+
+            {activePage === "playground" && (
+              <div className="card">
+                <div className="playground-area">
+                  <button
+                    className={`playground-record-btn ${
+                      playgroundStatus === "recording" ? "is-recording" : ""
+                    }`}
+                    onClick={
+                      playgroundStatus === "idle"
+                        ? startPlaygroundRecording
+                        : playgroundStatus === "recording"
+                          ? stopPlaygroundAndTranscribe
+                          : undefined
+                    }
+                    disabled={playgroundStatus === "transcribing"}
+                  >
+                    <Mic size={28} />
+                  </button>
+                  <div className="playground-status">
+                    {playgroundStatus === "recording"
+                      ? t("playgroundRecording")
+                      : playgroundStatus === "transcribing"
+                        ? t("playgroundTranscribing")
+                        : t("playgroundRecord")}
+                  </div>
+                  <div className="playground-transcript">
+                    {playgroundText || (
+                      <span className="playground-placeholder">
+                        {t("playgroundPlaceholder")}
+                      </span>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
