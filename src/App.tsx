@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Database,
   FileText,
@@ -72,16 +72,14 @@ type CloudTestState = {
   message?: string;
 };
 
-type DictationShortcutEvent = {
-  state: "pressed" | "released";
+type DictationStateEvent = {
+  state: "idle" | "listening" | "processing";
+  queueLen: number;
 };
 
-type DictationRecorder = {
-  context: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  processor: ScriptProcessorNode;
-  stream: MediaStream;
-  chunks: Float32Array[];
+type PlaygroundTranscriptionResult = {
+  text: string;
+  error: string | null;
 };
 
 type GlmDependencyStatus = {
@@ -203,48 +201,6 @@ const formatShortcutLabel = (shortcut: DictationShortcut) => {
     .filter(Boolean);
   return [...modifiers, keyLabel].join(" + ");
 };
-
-const mergeFloat32 = (chunks: Float32Array[]) => {
-  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
-  const result = new Float32Array(length);
-  let offset = 0;
-  chunks.forEach((chunk) => {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  });
-  return result;
-};
-
-const encodeWav = (samples: Float32Array, sampleRate: number) => {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-  const writeString = (offset: number, value: string) => {
-    for (let i = 0; i < value.length; i += 1) {
-      view.setUint8(offset + i, value.charCodeAt(i));
-    }
-  };
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  writeString(36, "data");
-  view.setUint32(40, samples.length * 2, true);
-  let offset = 44;
-  for (let i = 0; i < samples.length; i += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-    offset += 2;
-  }
-  return new Uint8Array(buffer);
-};
-
 
 const translations = {
   en: {
@@ -607,16 +563,11 @@ function App() {
   const [dictationState, setDictationState] = useState<
     "idle" | "listening" | "processing"
   >("idle");
-  const [dictationQueueCount, setDictationQueueCount] = useState(0);
-  const dictationRecorderRef = useRef<DictationRecorder | null>(null);
-  const dictationQueueRef = useRef<Uint8Array[]>([]);
-  const dictationListeningRef = useRef(false);
-  const dictationProcessingRef = useRef(false);
+  const [, setDictationQueueCount] = useState(0);
   const [playgroundStatus, setPlaygroundStatus] = useState<
     "idle" | "recording" | "transcribing"
   >("idle");
   const [playgroundText, setPlaygroundText] = useState("");
-  const playgroundRecorderRef = useRef<DictationRecorder | null>(null);
   const [activePage, setActivePage] = useState<
     "overview" | "models" | "logs" | "settings" | "playground"
   >("overview");
@@ -947,22 +898,11 @@ function App() {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     void (async () => {
-      unlisten = await listen<DictationShortcutEvent>(
-        "dictation-shortcut",
+      unlisten = await listen<DictationStateEvent>(
+        "dictation-state-changed",
         (event) => {
-          if (dictationCapture) {
-            return;
-          }
-          if (event.payload.state === "pressed") {
-            void startDictationRecording();
-            return;
-          }
-          void (async () => {
-            const wav = await stopDictationRecording();
-            if (wav) {
-              enqueueDictation(wav);
-            }
-          })();
+          setDictationState(event.payload.state);
+          setDictationQueueCount(event.payload.queueLen);
         },
       );
     })();
@@ -971,7 +911,44 @@ function App() {
         unlisten();
       }
     };
-  }, [dictationCapture]);
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      unlisten = await listen<PlaygroundTranscriptionResult>(
+        "playground-transcription-result",
+        (event) => {
+          const { text, error: err } = event.payload;
+          if (err) {
+            setError(err);
+          } else if (text.trim()) {
+            setPlaygroundText((prev) =>
+              prev ? prev + "\n" + text.trim() : text.trim(),
+            );
+          }
+          setPlaygroundStatus("idle");
+        },
+      );
+    })();
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const state = await invoke<DictationStateEvent>("get_dictation_state");
+        setDictationState(state.state);
+        setDictationQueueCount(state.queueLen);
+      } catch (err) {
+        console.warn("Failed to fetch initial dictation state:", err);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     if (!drawerOpen) {
@@ -986,20 +963,6 @@ function App() {
     return () => window.removeEventListener("keydown", handler);
   }, [drawerOpen]);
 
-  useEffect(() => {
-    void (async () => {
-      try {
-        await invoke("set_dictation_tray_state", {
-          update: {
-            state: dictationState,
-            queueLen: dictationQueueCount,
-          },
-        });
-      } catch (err) {
-        setError(String(err));
-      }
-    })();
-  }, [dictationState, dictationQueueCount]);
 
   const handleStart = async () => {
     setError(null);
@@ -1121,211 +1084,24 @@ function App() {
     }
   };
 
-
-  const syncDictationState = () => {
-    if (dictationListeningRef.current) {
-      setDictationState("listening");
-      return;
-    }
-    if (dictationProcessingRef.current) {
-      setDictationState("processing");
-      return;
-    }
-    setDictationState("idle");
-  };
-
-  const syncDictationQueueCount = () => {
-    setDictationQueueCount(dictationQueueRef.current.length);
-  };
-
-  const startDictationRecording = async () => {
-    if (dictationListeningRef.current) {
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const context = new AudioContext();
-      await context.resume();
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      const chunks: Float32Array[] = [];
-      processor.onaudioprocess = (event) => {
-        if (!dictationListeningRef.current) {
-          return;
-        }
-        const input = event.inputBuffer.getChannelData(0);
-        chunks.push(new Float32Array(input));
-      };
-      source.connect(processor);
-      processor.connect(context.destination);
-      dictationRecorderRef.current = {
-        context,
-        source,
-        processor,
-        stream,
-        chunks,
-      };
-      dictationListeningRef.current = true;
-      syncDictationState();
-    } catch (err) {
-      const errStr = String(err);
-      if (
-        errStr.includes("NotAllowedError") ||
-        errStr.includes("not allowed") ||
-        errStr.includes("denied permission")
-      ) {
-        setPermissionError("microphone");
-      } else {
-        setError(errStr);
-      }
-      dictationListeningRef.current = false;
-      syncDictationState();
-    }
-  };
-
-  const stopDictationRecording = async () => {
-    const recorder = dictationRecorderRef.current;
-    dictationListeningRef.current = false;
-    if (!recorder) {
-      syncDictationState();
-      return null;
-    }
-    const { context, source, processor, stream, chunks } = recorder;
-    processor.disconnect();
-    source.disconnect();
-    processor.onaudioprocess = null;
-    stream.getTracks().forEach((track) => track.stop());
-    const sampleRate = context.sampleRate;
-    await context.close();
-    dictationRecorderRef.current = null;
-    syncDictationState();
-    const merged = mergeFloat32(chunks);
-    if (merged.length < sampleRate * 0.15) {
-      return null;
-    }
-    return encodeWav(merged, sampleRate);
-  };
-
-  const processDictationQueue = async () => {
-    if (dictationProcessingRef.current) {
-      return;
-    }
-    const next = dictationQueueRef.current.shift();
-    syncDictationQueueCount();
-    if (!next) {
-      syncDictationState();
-      return;
-    }
-    dictationProcessingRef.current = true;
-    syncDictationState();
-    try {
-      const text = await invoke<string>("transcribe_audio", {
-        request: {
-          bytes: Array.from(next),
-          fileName: "dictation.wav",
-          modelId: activeModelId ?? "base",
-        },
-      });
-      const trimmed = text.trim();
-      if (trimmed) {
-        await navigator.clipboard.writeText(trimmed);
-        if (uiSettings.dictationAutoPaste) {
-          await new Promise((resolve) => setTimeout(resolve, 80));
-          await invoke("paste_clipboard");
-        }
-      }
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      dictationProcessingRef.current = false;
-      syncDictationState();
-      void processDictationQueue();
-    }
-  };
-
-  const enqueueDictation = (wavBytes: Uint8Array) => {
-    dictationQueueRef.current.push(wavBytes);
-    syncDictationQueueCount();
-    void processDictationQueue();
-  };
-
   const startPlaygroundRecording = async () => {
     if (playgroundStatus === "recording") {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const context = new AudioContext();
-      await context.resume();
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      const chunks: Float32Array[] = [];
-      processor.onaudioprocess = (event) => {
-        if (playgroundRecorderRef.current) {
-          const input = event.inputBuffer.getChannelData(0);
-          chunks.push(new Float32Array(input));
-        }
-      };
-      source.connect(processor);
-      processor.connect(context.destination);
-      playgroundRecorderRef.current = {
-        context,
-        source,
-        processor,
-        stream,
-        chunks,
-      };
+      await invoke("start_playground_recording");
       setPlaygroundStatus("recording");
     } catch (err) {
-      const errStr = String(err);
-      if (
-        errStr.includes("NotAllowedError") ||
-        errStr.includes("not allowed") ||
-        errStr.includes("denied permission")
-      ) {
-        setPermissionError("microphone");
-      } else {
-        setError(errStr);
-      }
+      setError(String(err));
     }
   };
 
   const stopPlaygroundAndTranscribe = async () => {
-    const recorder = playgroundRecorderRef.current;
-    if (!recorder) {
-      setPlaygroundStatus("idle");
-      return;
-    }
-    const { context, source, processor, stream, chunks } = recorder;
-    processor.disconnect();
-    source.disconnect();
-    processor.onaudioprocess = null;
-    stream.getTracks().forEach((track) => track.stop());
-    const sampleRate = context.sampleRate;
-    await context.close();
-    playgroundRecorderRef.current = null;
-    const merged = mergeFloat32(chunks);
-    if (merged.length < sampleRate * 0.15) {
-      setPlaygroundStatus("idle");
-      return;
-    }
-    const wav = encodeWav(merged, sampleRate);
     setPlaygroundStatus("transcribing");
     try {
-      const text = await invoke<string>("transcribe_audio", {
-        request: {
-          bytes: Array.from(wav),
-          fileName: "playground.wav",
-          modelId: activeModelId ?? "base",
-        },
-      });
-      const trimmed = text.trim();
-      if (trimmed) {
-        setPlaygroundText((prev) => (prev ? prev + "\n" + trimmed : trimmed));
-      }
+      await invoke("stop_playground_recording");
     } catch (err) {
       setError(String(err));
-    } finally {
       setPlaygroundStatus("idle");
     }
   };

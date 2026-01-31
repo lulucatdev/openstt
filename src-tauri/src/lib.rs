@@ -1,5 +1,7 @@
 mod audio;
+mod dictation;
 mod models;
+mod recording;
 
 use axum::{
     extract::{Multipart, State as AxumState},
@@ -58,6 +60,7 @@ struct AppState {
     tray_snapshot: Arc<Mutex<Option<TraySnapshot>>>,
     dictation_shortcut: Arc<Mutex<Option<Shortcut>>>,
     dictation_tray_state: Arc<Mutex<DictationTrayState>>,
+    dictation: Arc<dictation::DictationManager>,
 }
 
 struct ServerRuntime {
@@ -247,8 +250,8 @@ struct GlmTranscriptionResponse {
     text: String,
 }
 
-struct TranscribeError {
-    message: String,
+pub(crate) struct TranscribeError {
+    pub(crate) message: String,
 }
 
 impl TranscribeError {
@@ -272,13 +275,6 @@ struct TranscribeAudioRequest {
     file_name: Option<String>,
     model_id: Option<String>,
     language: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DictationTrayUpdate {
-    state: String,
-    queue_len: u32,
 }
 
 
@@ -420,6 +416,7 @@ impl AppState {
             tray_snapshot: Arc::new(Mutex::new(None)),
             dictation_shortcut: Arc::new(Mutex::new(None)),
             dictation_tray_state: Arc::new(Mutex::new(DictationTrayState::default())),
+            dictation: Arc::new(dictation::DictationManager::new()),
         }
     }
 }
@@ -531,13 +528,41 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                 }
                 let flags = event.get_flags();
                 let is_down = flags.contains(target_flag);
-                let state_value = if is_down { "pressed" } else { "released" };
-                let _ = app.emit(
-                    "dictation-shortcut",
-                    DictationShortcutEvent {
-                        state: state_value.to_string(),
-                    },
-                );
+                let app_state = state.clone();
+                let app_handle = app.clone();
+                if is_down {
+                    if let Err(err) = app_state.dictation.start_recording() {
+                        let logs = app_state.logs.clone();
+                        tauri::async_runtime::spawn(async move {
+                            logs.push("error", format!("Dictation start failed: {err}")).await;
+                        });
+                    } else {
+                        tauri::async_runtime::spawn(async move {
+                            app_state.dictation.emit_state(&app_handle).await;
+                            let mut tray = app_state.dictation_tray_state.lock().await;
+                            tray.state = "listening".to_string();
+                            tray.queue_len = app_state.dictation.queue_len().await;
+                            drop(tray);
+                            refresh_tray(&app_state).await;
+                        });
+                    }
+                } else {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = app_state.dictation.stop_recording().await;
+                        app_state.dictation.emit_state(&app_handle).await;
+                        let mut tray = app_state.dictation_tray_state.lock().await;
+                        tray.state = app_state.dictation.current_state().as_str().to_string();
+                        tray.queue_len = app_state.dictation.queue_len().await;
+                        drop(tray);
+                        refresh_tray(&app_state).await;
+                        app_state.dictation.process_queue(&app_state, &app_handle).await;
+                        let mut tray = app_state.dictation_tray_state.lock().await;
+                        tray.state = app_state.dictation.current_state().as_str().to_string();
+                        tray.queue_len = app_state.dictation.queue_len().await;
+                        drop(tray);
+                        refresh_tray(&app_state).await;
+                    });
+                }
                 Some(event.clone())
             },
         );
@@ -570,12 +595,6 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
             });
         }
     });
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct DictationShortcutEvent {
-    state: String,
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -1432,7 +1451,7 @@ async fn cloud_transcribe(
     result
 }
 
-async fn transcribe_bytes(
+pub(crate) async fn transcribe_bytes(
     state: &AppState,
     model: Option<String>,
     file_name: Option<String>,
@@ -1827,8 +1846,80 @@ async fn transcribe_audio(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationStateResponse {
+    state: String,
+    queue_len: u32,
+}
+
 #[tauri::command]
-async fn paste_clipboard() -> Result<(), String> {
+async fn start_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
+    state.dictation.start_recording()?;
+    if let Some(app_handle) = state.app_handle.lock().await.clone() {
+        state.dictation.emit_state(&app_handle).await;
+    }
+    let mut tray_state = state.dictation_tray_state.lock().await;
+    tray_state.state = "listening".to_string();
+    tray_state.queue_len = state.dictation.queue_len().await;
+    drop(tray_state);
+    refresh_tray(&state).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
+    state.dictation.stop_recording().await?;
+    if let Some(app_handle) = state.app_handle.lock().await.clone() {
+        state.dictation.emit_state(&app_handle).await;
+    }
+    let mut tray_state = state.dictation_tray_state.lock().await;
+    tray_state.state = state.dictation.current_state().as_str().to_string();
+    tray_state.queue_len = state.dictation.queue_len().await;
+    drop(tray_state);
+    refresh_tray(&state).await;
+    let app_state = (*state).clone();
+    let app_handle = state.app_handle.lock().await.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(app_handle) = app_handle {
+            app_state.dictation.process_queue(&app_state, &app_handle).await;
+            let mut tray_state = app_state.dictation_tray_state.lock().await;
+            tray_state.state = app_state.dictation.current_state().as_str().to_string();
+            tray_state.queue_len = app_state.dictation.queue_len().await;
+            drop(tray_state);
+            refresh_tray(&app_state).await;
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_playground_recording(state: TauriState<'_, AppState>) -> Result<(), String> {
+    state.dictation.start_playground()
+}
+
+#[tauri::command]
+async fn stop_playground_recording(state: TauriState<'_, AppState>) -> Result<(), String> {
+    let app_state = (*state).clone();
+    let app_handle = state.app_handle.lock().await.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = app_state.dictation.stop_playground_and_transcribe(&app_state).await;
+        if let Some(app_handle) = app_handle {
+            let _ = app_handle.emit("playground-transcription-result", result);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_dictation_state(state: TauriState<'_, AppState>) -> Result<DictationStateResponse, String> {
+    Ok(DictationStateResponse {
+        state: state.dictation.current_state().as_str().to_string(),
+        queue_len: state.dictation.queue_len().await,
+    })
+}
+
+pub(crate) async fn paste_clipboard_inner() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let status = Command::new("osascript")
@@ -1849,18 +1940,10 @@ async fn paste_clipboard() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn set_dictation_tray_state(
-    state: TauriState<'_, AppState>,
-    update: DictationTrayUpdate,
-) -> Result<(), String> {
-    {
-        let mut dictation = state.dictation_tray_state.lock().await;
-        dictation.state = update.state;
-        dictation.queue_len = update.queue_len;
-    }
-    refresh_tray(&state).await;
-    Ok(())
+async fn paste_clipboard() -> Result<(), String> {
+    paste_clipboard_inner().await
 }
+
 
 #[tauri::command]
 async fn get_cloud_usage(state: TauriState<'_, AppState>) -> Result<CloudUsage, String> {
@@ -2469,16 +2552,44 @@ pub fn run() {
                             {
                                 return;
                             }
-                            let state_value = match event.state() {
-                                ShortcutState::Pressed => "pressed",
-                                ShortcutState::Released => "released",
-                            };
-                            let _ = app.emit(
-                                "dictation-shortcut",
-                                DictationShortcutEvent {
-                                    state: state_value.to_string(),
-                                },
-                            );
+                            let app_state = (*state).clone();
+                            let app_handle = app.clone();
+                            match event.state() {
+                                ShortcutState::Pressed => {
+                                    if let Err(err) = app_state.dictation.start_recording() {
+                                        let logs = app_state.logs.clone();
+                                        tauri::async_runtime::spawn(async move {
+                                            logs.push("error", format!("Dictation start failed: {err}")).await;
+                                        });
+                                        return;
+                                    }
+                                    tauri::async_runtime::spawn(async move {
+                                        app_state.dictation.emit_state(&app_handle).await;
+                                        let mut tray = app_state.dictation_tray_state.lock().await;
+                                        tray.state = "listening".to_string();
+                                        tray.queue_len = app_state.dictation.queue_len().await;
+                                        drop(tray);
+                                        refresh_tray(&app_state).await;
+                                    });
+                                }
+                                ShortcutState::Released => {
+                                    tauri::async_runtime::spawn(async move {
+                                        let _ = app_state.dictation.stop_recording().await;
+                                        app_state.dictation.emit_state(&app_handle).await;
+                                        let mut tray = app_state.dictation_tray_state.lock().await;
+                                        tray.state = app_state.dictation.current_state().as_str().to_string();
+                                        tray.queue_len = app_state.dictation.queue_len().await;
+                                        drop(tray);
+                                        refresh_tray(&app_state).await;
+                                        app_state.dictation.process_queue(&app_state, &app_handle).await;
+                                        let mut tray = app_state.dictation_tray_state.lock().await;
+                                        tray.state = app_state.dictation.current_state().as_str().to_string();
+                                        tray.queue_len = app_state.dictation.queue_len().await;
+                                        drop(tray);
+                                        refresh_tray(&app_state).await;
+                                    });
+                                }
+                            }
                         })
                         .build(),
                 )?;
@@ -2659,7 +2770,11 @@ pub fn run() {
             test_cloud_api_key,
             transcribe_audio,
             paste_clipboard,
-            set_dictation_tray_state,
+            start_dictation,
+            stop_dictation,
+            start_playground_recording,
+            stop_playground_recording,
+            get_dictation_state,
             list_models,
             download_model,
             delete_model,
