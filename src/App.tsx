@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   Menu,
   Settings,
+  Shield,
   Square,
   Trash2,
   X,
@@ -13,7 +14,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openUrl } from "@tauri-apps/plugin-opener";
+
 import "./App.css";
 
 type ServerStatus = {
@@ -360,6 +361,14 @@ const translations = {
     onboardingSkip: "Set up later",
     onboardingAllDone: "All permissions granted!",
     stopDictation: "Stop",
+    runtimeInstallSuccess: "MLX runtime installed successfully",
+    pagePermissions: "Permissions",
+    pagePermissionsDesc: "Manage system permissions",
+    permissionGranted: "Granted",
+    permissionNotGranted: "Not Granted",
+    permissionRefreshAll: "Refresh All",
+    inputMonitoringPermission: "Input Monitoring",
+    inputMonitoringPermissionHint: "Required for global keyboard shortcut",
   },
   zh: {
     appName: "OpenSTT",
@@ -521,6 +530,14 @@ const translations = {
     onboardingSkip: "稍后设置",
     onboardingAllDone: "所有权限已授予！",
     stopDictation: "停止",
+    runtimeInstallSuccess: "MLX 运行时安装成功",
+    pagePermissions: "权限",
+    pagePermissionsDesc: "管理系统权限",
+    permissionGranted: "已授权",
+    permissionNotGranted: "未授权",
+    permissionRefreshAll: "刷新全部",
+    inputMonitoringPermission: "输入监控",
+    inputMonitoringPermissionHint: "全局快捷键需要此权限",
   },
 } as const;
 
@@ -551,8 +568,9 @@ function App() {
     "idle" | "recording" | "transcribing"
   >("idle");
   const [playgroundText, setPlaygroundText] = useState("");
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [activePage, setActivePage] = useState<
-    "overview" | "models" | "logs" | "settings"
+    "overview" | "models" | "permissions" | "logs" | "settings"
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
@@ -601,6 +619,12 @@ function App() {
       label: t("pageModels"),
       description: t("pageModelsDesc"),
       icon: Database,
+    },
+    {
+      id: "permissions",
+      label: t("pagePermissions"),
+      description: t("pagePermissionsDesc"),
+      icon: Shield,
     },
     {
       id: "logs",
@@ -843,6 +867,7 @@ function App() {
         if (
           page === "overview" ||
           page === "models" ||
+          page === "permissions" ||
           page === "logs" ||
           page === "settings"
         ) {
@@ -1049,12 +1074,8 @@ function App() {
   const handleOpenPermissionSettings = async (
     target: "microphone" | "accessibility",
   ) => {
-    const url =
-      target === "microphone"
-        ? "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        : "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
     try {
-      await openUrl(url);
+      await invoke("open_permission_settings", { target });
     } catch (err) {
       setError(String(err));
     }
@@ -1128,6 +1149,9 @@ function App() {
         "mlx_install_dependencies",
       );
       setMlxDeps(status);
+      if (status.ready) {
+        setSuccessMessage(t("runtimeInstallSuccess"));
+      }
     } catch (err) {
       setError(String(err));
     } finally {
@@ -1145,8 +1169,11 @@ function App() {
     setMlxAction("setup");
     try {
       if (!(mlxDeps?.ready ?? false)) {
-        await invoke<MlxDependencyStatus>("mlx_install_dependencies");
+        const status = await invoke<MlxDependencyStatus>("mlx_install_dependencies");
         await refreshMlxDeps();
+        if (status.ready) {
+          setSuccessMessage(t("runtimeInstallSuccess"));
+        }
       }
       setDownloadProgress((prev) => ({ ...prev, [modelId]: 0 }));
       await invoke("download_model", { modelId });
@@ -1208,6 +1235,12 @@ function App() {
       return null;
     }
   };
+
+  useEffect(() => {
+    if (!successMessage) return;
+    const timer = setTimeout(() => setSuccessMessage(null), 5000);
+    return () => clearTimeout(timer);
+  }, [successMessage]);
 
   const allPermissionsGranted = permissionStatus
     ? permissionStatus.inputMonitoring &&
@@ -1347,6 +1380,14 @@ function App() {
               <div className="error-banner global-error">
                 <span>{error}</span>
                 <button className="error-dismiss" onClick={() => setError(null)} aria-label="Dismiss">
+                  <X size={12} strokeWidth={2} />
+                </button>
+              </div>
+            )}
+            {successMessage && (
+              <div className="success-banner global-error">
+                <span>{successMessage}</span>
+                <button className="success-dismiss" onClick={() => setSuccessMessage(null)} aria-label="Dismiss">
                   <X size={12} strokeWidth={2} />
                 </button>
               </div>
@@ -1877,6 +1918,130 @@ function App() {
               </div>
             )}
 
+            {activePage === "permissions" && (
+              <>
+                <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+                  <button
+                    className="button tiny"
+                    onClick={refreshPermissions}
+                  >
+                    {t("permissionRefreshAll")}
+                  </button>
+                </div>
+
+                {/* Input Monitoring */}
+                <div className="card">
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("inputMonitoringPermission")}</div>
+                        <div className="settings-hint">{t("inputMonitoringPermissionHint")}</div>
+                      </div>
+                      <div className="settings-actions">
+                        <span
+                          className={`runtime-status ${permissionStatus?.inputMonitoring ? "is-ready" : "is-missing"}`}
+                        >
+                          {permissionStatus?.inputMonitoring ? t("permissionGranted") : t("permissionNotGranted")}
+                        </span>
+                        {!permissionStatus?.inputMonitoring && (
+                          <button
+                            className="button tiny primary"
+                            onClick={() => invoke("open_permission_settings", { target: "input_monitoring" })}
+                          >
+                            {t("onboardingOpenSettings")}
+                          </button>
+                        )}
+                        <button
+                          className="button tiny"
+                          onClick={refreshPermissions}
+                        >
+                          {t("onboardingCheckPermission")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Microphone */}
+                <div className="card">
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("microphonePermission")}</div>
+                        <div className="settings-hint">{t("microphonePermissionHint")}</div>
+                      </div>
+                      <div className="settings-actions">
+                        <span
+                          className={`runtime-status ${permissionStatus?.microphone === "granted" ? "is-ready" : "is-missing"}`}
+                        >
+                          {permissionStatus?.microphone === "granted" ? t("permissionGranted") : t("permissionNotGranted")}
+                        </span>
+                        {permissionStatus?.microphone !== "granted" && (
+                          permissionStatus?.microphone === "denied" ? (
+                            <button
+                              className="button tiny primary"
+                              onClick={() => handleOpenPermissionSettings("microphone")}
+                            >
+                              {t("openMicrophoneSettings")}
+                            </button>
+                          ) : (
+                            <button
+                              className="button tiny primary"
+                              onClick={async () => {
+                                await handleRequestMicrophone();
+                                await refreshPermissions();
+                              }}
+                            >
+                              {t("onboardingGrantAccess")}
+                            </button>
+                          )
+                        )}
+                        <button
+                          className="button tiny"
+                          onClick={refreshPermissions}
+                        >
+                          {t("onboardingCheckPermission")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Accessibility */}
+                <div className="card">
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("accessibilityPermission")}</div>
+                        <div className="settings-hint">{t("accessibilityPermissionHint")}</div>
+                      </div>
+                      <div className="settings-actions">
+                        <span
+                          className={`runtime-status ${permissionStatus?.accessibility ? "is-ready" : "is-missing"}`}
+                        >
+                          {permissionStatus?.accessibility ? t("permissionGranted") : t("permissionNotGranted")}
+                        </span>
+                        {!permissionStatus?.accessibility && (
+                          <button
+                            className="button tiny primary"
+                            onClick={() => handleOpenPermissionSettings("accessibility")}
+                          >
+                            {t("onboardingOpenSettings")}
+                          </button>
+                        )}
+                        <button
+                          className="button tiny"
+                          onClick={refreshPermissions}
+                        >
+                          {t("onboardingCheckPermission")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+
             {activePage === "logs" && (
               <div className="card logs-card">
                 <div className="card-header">
@@ -2038,58 +2203,6 @@ function App() {
                       >
                         <span className="switch-thumb" />
                       </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="card settings-section">
-                  <h3>{t("permissionsTitle")}</h3>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("microphonePermission")}
-                        </div>
-                        <div className="settings-hint">
-                          {t("microphonePermissionHint")}
-                        </div>
-                      </div>
-                      <div className="settings-actions">
-                        <button
-                          className="button tiny"
-                          onClick={handleRequestMicrophone}
-                        >
-                          {t("requestPermission")}
-                        </button>
-                        <button
-                          className="button tiny ghost"
-                          onClick={() =>
-                            handleOpenPermissionSettings("microphone")
-                          }
-                        >
-                          {t("openMicrophoneSettings")}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("accessibilityPermission")}
-                        </div>
-                        <div className="settings-hint">
-                          {t("accessibilityPermissionHint")}
-                        </div>
-                      </div>
-                      <div className="settings-actions">
-                        <button
-                          className="button tiny ghost"
-                          onClick={() =>
-                            handleOpenPermissionSettings("accessibility")
-                          }
-                        >
-                          {t("openAccessibilitySettings")}
-                        </button>
-                      </div>
                     </div>
                   </div>
                 </div>

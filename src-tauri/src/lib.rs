@@ -1730,27 +1730,36 @@ fn check_accessibility() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-async fn check_microphone() -> String {
-    let output = Command::new("swift")
-        .arg("-e")
-        .arg("import AVFoundation; let s = AVCaptureDevice.authorizationStatus(for: .audio); switch s { case .authorized: print(\"granted\"); case .denied, .restricted: print(\"denied\"); default: print(\"not_determined\") }")
-        .output()
-        .await;
-    match output {
-        Ok(out) => {
-            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if result == "granted" || result == "denied" || result == "not_determined" {
-                result
-            } else {
-                "not_determined".to_string()
-            }
+fn check_microphone() -> String {
+    use std::ffi::c_void;
+
+    extern "C" {
+        static AVMediaTypeAudio: *const c_void;
+        fn objc_getClass(name: *const u8) -> *const c_void;
+        fn sel_registerName(name: *const u8) -> *const c_void;
+    }
+    type MsgSendFn = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void) -> isize;
+    extern "C" {
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let class = objc_getClass(b"AVCaptureDevice\0".as_ptr());
+        let sel = sel_registerName(b"authorizationStatusForMediaType:\0".as_ptr());
+        let send: MsgSendFn = std::mem::transmute(objc_msgSend as *const c_void);
+        let status = send(class, sel, AVMediaTypeAudio);
+        // AVAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied, 3=authorized
+        match status {
+            3 => "granted",
+            1 | 2 => "denied",
+            _ => "not_determined",
         }
-        Err(_) => "not_determined".to_string(),
+        .to_string()
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn check_microphone() -> String {
+fn check_microphone() -> String {
     "granted".to_string()
 }
 
@@ -1772,14 +1781,11 @@ fn check_input_monitoring() -> bool {
 }
 
 #[tauri::command]
-async fn check_all_permissions() -> Result<PermissionStatus, String> {
-    let accessibility = check_accessibility();
-    let input_monitoring = check_input_monitoring();
-    let microphone = check_microphone().await;
+fn check_all_permissions() -> Result<PermissionStatus, String> {
     Ok(PermissionStatus {
-        accessibility,
-        microphone,
-        input_monitoring,
+        accessibility: check_accessibility(),
+        microphone: check_microphone(),
+        input_monitoring: check_input_monitoring(),
     })
 }
 
