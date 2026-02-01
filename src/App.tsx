@@ -1204,9 +1204,13 @@ function App() {
             </nav>
             <div className="sidebar-footer">
               <div className="sidebar-status">
-                <div className={`status-pill is-${appStatus}`}>
+                <div className={`status-pill is-${isRunning ? "ready" : "stopped"}`}>
                   <span className="status-dot" />
-                  {t(`status_${appStatus}` as keyof (typeof translations)["en"])}
+                  {t("gateway")}: {isRunning ? t("running") : t("stopped")}
+                </div>
+                <div className={`status-pill is-${dictationState === "idle" ? (mlxReady ? "ready" : "loading") : dictationState === "listening" ? "listening" : "transcribing"}`}>
+                  <span className="status-dot" />
+                  {t("dictationTitle")}: {dictationState === "idle" ? (mlxReady ? t("dictationIdle") : t("runtimeMissing")) : dictationState === "listening" ? t("dictationListening") : t("dictationProcessing")}
                 </div>
               </div>
               <div className="sidebar-meta">
@@ -1266,6 +1270,211 @@ function App() {
           <div className="content-body">
             {activePage === "overview" && (
               <>
+                {/* MLX Runtime */}
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("runtimeTitle")}</h2>
+                      <p className="muted">{t("runtimeDesc")}</p>
+                    </div>
+                    <span
+                      className={`runtime-status ${
+                        mlxReady
+                          ? "is-ready"
+                          : mlxSupported
+                            ? "is-missing"
+                            : "is-unsupported"
+                      }`}
+                    >
+                      {mlxReady
+                        ? t("runtimeReady")
+                        : mlxSupported
+                          ? t("runtimeMissing")
+                          : t("runtimeUnsupported")}
+                    </span>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("runtimeTitle")}
+                        </div>
+                      </div>
+                      <div className="badge-row">
+                        {mlxSupported && !mlxReady && (
+                          <button
+                            className="button tiny primary"
+                            onClick={handleInstallMlx}
+                            disabled={mlxAction === "install"}
+                          >
+                            {mlxAction === "install"
+                              ? t("runtimeInstalling")
+                              : t("runtimeInstall")}
+                          </button>
+                        )}
+                        {(mlxAction === "install" || mlxAction === "setup") && (
+                          <button
+                            className="button tiny ghost"
+                            onClick={() => setActivePage("logs")}
+                          >
+                            {t("viewLogs")}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Model */}
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("overviewModelTitle")}</h2>
+                      <p className="muted">{t("overviewModelDesc")}</p>
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("activeModel")}
+                        </div>
+                        {!activeModelId && (
+                          <div className="settings-hint">
+                            {t("noActiveModelHint")}
+                          </div>
+                        )}
+                      </div>
+                      <div className="badge-row">
+                        <span className="badge">
+                          {activeModelId
+                            ? (models.find((m) => m.id === activeModelId)?.name ?? activeModelId)
+                            : t("noActiveModel")}
+                        </span>
+                        <button
+                          className="button tiny"
+                          onClick={() => setActivePage("models")}
+                        >
+                          {t("dictationShortcutChange")}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Dictation */}
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("dictationTitle")}</h2>
+                      <p className="muted">{t("dictationDesc")}</p>
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("dictationShortcutLabel")}
+                        </div>
+                      </div>
+                      <div className="badge-row">
+                        <span className="badge">
+                          {dictationCapture
+                            ? t("dictationShortcutListening")
+                            : formatShortcutLabel(uiSettings.dictationShortcut)}
+                        </span>
+                        <button
+                          className="button tiny"
+                          onClick={() => setDictationCapture(!dictationCapture)}
+                        >
+                          {dictationCapture
+                            ? t("done")
+                            : t("dictationShortcutChange")}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("dictationAutoPaste")}
+                        </div>
+                        <div className="settings-hint">
+                          {t("dictationAutoPasteHint")}
+                        </div>
+                      </div>
+                      <button
+                        className={`switch ${
+                          uiSettings.dictationAutoPaste ? "is-on" : ""
+                        }`}
+                        onClick={() =>
+                          persistSettings({
+                            ...uiSettings,
+                            dictationAutoPaste: !uiSettings.dictationAutoPaste,
+                          })
+                        }
+                        aria-pressed={uiSettings.dictationAutoPaste}
+                      >
+                        <span className="switch-thumb" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Playground */}
+                <div className="card">
+                  <div className="card-header">
+                    <div>
+                      <h2>{t("playgroundTitle")}</h2>
+                      <p className="muted">{t("playgroundDesc")}</p>
+                    </div>
+                    <div className="badge-row">
+                      {playgroundStatus !== "idle" && (
+                        <span className="badge">
+                          {playgroundStatus === "recording"
+                            ? t("playgroundRecording")
+                            : t("playgroundTranscribing")}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("playgroundRecord")}
+                        </div>
+                      </div>
+                      <div className="badge-row">
+                        <button
+                          className="button tiny primary"
+                          onClick={startPlaygroundRecording}
+                          disabled={playgroundStatus !== "idle"}
+                        >
+                          {t("playgroundRecord")}
+                        </button>
+                        <button
+                          className="button tiny"
+                          onClick={stopPlaygroundAndTranscribe}
+                          disabled={playgroundStatus !== "recording"}
+                        >
+                          {t("playgroundStop")}
+                        </button>
+                      </div>
+                    </div>
+                    {playgroundText && (
+                      <div className="settings-row">
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div className="settings-label">
+                            {t("playgroundPlaceholder")}
+                          </div>
+                          <div className="settings-hint">{playgroundText}</div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Gateway (Service Control) */}
                 <div className="card">
                   <div className="card-header">
                     <div>
@@ -1351,99 +1560,7 @@ function App() {
                   )}
                 </div>
 
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("overviewModelTitle")}</h2>
-                      <p className="muted">{t("overviewModelDesc")}</p>
-                    </div>
-                  </div>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("activeModel")}
-                        </div>
-                        {!activeModelId && (
-                          <div className="settings-hint">
-                            {t("noActiveModelHint")}
-                          </div>
-                        )}
-                      </div>
-                      <div className="badge-row">
-                        <span className="badge">
-                          {activeModelId
-                            ? (models.find((m) => m.id === activeModelId)?.name ?? activeModelId)
-                            : t("noActiveModel")}
-                        </span>
-                        <button
-                          className="button tiny"
-                          onClick={() => setActivePage("models")}
-                        >
-                          {t("dictationShortcutChange")}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("dictationTitle")}</h2>
-                      <p className="muted">{t("dictationDesc")}</p>
-                    </div>
-                  </div>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("dictationShortcutLabel")}
-                        </div>
-                      </div>
-                      <div className="badge-row">
-                        <span className="badge">
-                          {dictationCapture
-                            ? t("dictationShortcutListening")
-                            : formatShortcutLabel(uiSettings.dictationShortcut)}
-                        </span>
-                        <button
-                          className="button tiny"
-                          onClick={() => setDictationCapture(!dictationCapture)}
-                        >
-                          {dictationCapture
-                            ? t("done")
-                            : t("dictationShortcutChange")}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("dictationAutoPaste")}
-                        </div>
-                        <div className="settings-hint">
-                          {t("dictationAutoPasteHint")}
-                        </div>
-                      </div>
-                      <button
-                        className={`switch ${
-                          uiSettings.dictationAutoPaste ? "is-on" : ""
-                        }`}
-                        onClick={() =>
-                          persistSettings({
-                            ...uiSettings,
-                            dictationAutoPaste: !uiSettings.dictationAutoPaste,
-                          })
-                        }
-                        aria-pressed={uiSettings.dictationAutoPaste}
-                      >
-                        <span className="switch-thumb" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
+                {/* Endpoints */}
                 <div className="card">
                   <div className="card-header">
                     <div>
@@ -1472,59 +1589,6 @@ function App() {
                         {t("healthEndpointDesc")}
                       </div>
                     </div>
-                  </div>
-                </div>
-
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("playgroundTitle")}</h2>
-                      <p className="muted">{t("playgroundDesc")}</p>
-                    </div>
-                    <div className="badge-row">
-                      {playgroundStatus !== "idle" && (
-                        <span className="badge">
-                          {playgroundStatus === "recording"
-                            ? t("playgroundRecording")
-                            : t("playgroundTranscribing")}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("playgroundRecord")}
-                        </div>
-                      </div>
-                      <div className="badge-row">
-                        <button
-                          className="button tiny primary"
-                          onClick={startPlaygroundRecording}
-                          disabled={playgroundStatus !== "idle"}
-                        >
-                          {t("playgroundRecord")}
-                        </button>
-                        <button
-                          className="button tiny"
-                          onClick={stopPlaygroundAndTranscribe}
-                          disabled={playgroundStatus !== "recording"}
-                        >
-                          {t("playgroundStop")}
-                        </button>
-                      </div>
-                    </div>
-                    {playgroundText && (
-                      <div className="settings-row">
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div className="settings-label">
-                            {t("playgroundPlaceholder")}
-                          </div>
-                          <div className="settings-hint">{playgroundText}</div>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 </div>
 

@@ -42,3 +42,6 @@ src-tauri/Cargo.lock
 *.ggml
 *.bin
 *.mlmodelc
+
+# Release Script
+release.sh

@@ -55,6 +55,7 @@ struct AppState {
     active_model_id: Arc<Mutex<String>>,
     cached_context: Arc<Mutex<Option<CachedWhisperContext>>>,
     mlx_sidecar: Arc<Mutex<Option<MlxSidecar>>>,
+    mlx_ready: Arc<Mutex<bool>>,
 
     app_handle: Arc<Mutex<Option<tauri::AppHandle>>>,
     tray_snapshot: Arc<Mutex<Option<TraySnapshot>>>,
@@ -411,6 +412,7 @@ impl AppState {
             active_model_id: Arc::new(Mutex::new(default_model_id())),
             cached_context: Arc::new(Mutex::new(None)),
             mlx_sidecar: Arc::new(Mutex::new(None)),
+            mlx_ready: Arc::new(Mutex::new(false)),
 
             app_handle: Arc::new(Mutex::new(None)),
             tray_snapshot: Arc::new(Mutex::new(None)),
@@ -814,8 +816,11 @@ async fn recompute_and_emit_app_status(state: &AppState) {
         dictation::DictationState::Listening => AppStatus::Listening,
         dictation::DictationState::Processing => AppStatus::Transcribing,
         dictation::DictationState::Idle => {
-            if state.runtime.lock().await.is_some() {
+            let mlx_ok = *state.mlx_ready.lock().await;
+            if state.runtime.lock().await.is_some() && mlx_ok {
                 AppStatus::Ready
+            } else if state.runtime.lock().await.is_some() {
+                AppStatus::Loading
             } else {
                 AppStatus::Stopped
             }
@@ -940,8 +945,11 @@ async fn mlx_dependency_status_inner() -> MlxDependencyStatus {
 }
 
 #[tauri::command]
-async fn mlx_dependency_status() -> Result<MlxDependencyStatus, String> {
-    Ok(mlx_dependency_status_inner().await)
+async fn mlx_dependency_status(state: TauriState<'_, AppState>) -> Result<MlxDependencyStatus, String> {
+    let status = mlx_dependency_status_inner().await;
+    *state.mlx_ready.lock().await = status.ready;
+    recompute_and_emit_app_status(&state).await;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -998,7 +1006,10 @@ async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<Mlx
         return Err("Failed to install mlx-audio".to_string());
     }
 
-    Ok(mlx_dependency_status_inner().await)
+    let status = mlx_dependency_status_inner().await;
+    *state.mlx_ready.lock().await = status.ready;
+    recompute_and_emit_app_status(&state).await;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1013,6 +1024,8 @@ async fn mlx_reset_runtime(state: TauriState<'_, AppState>) -> Result<(), String
             .map_err(|err| format!("Failed to remove venv: {err}"))?;
     }
     state.logs.push("info", "MLX runtime reset").await;
+    *state.mlx_ready.lock().await = false;
+    recompute_and_emit_app_status(&state).await;
     Ok(())
 }
 
@@ -2695,6 +2708,16 @@ pub fn run() {
                             refresh_tray(&state_for_ticker).await;
                         }
                     }
+                }
+            });
+
+            // Initial MLX runtime status check
+            tauri::async_runtime::spawn({
+                let state_clone = (*state).clone();
+                async move {
+                    let status = mlx_dependency_status_inner().await;
+                    *state_clone.mlx_ready.lock().await = status.ready;
+                    recompute_and_emit_app_status(&state_clone).await;
                 }
             });
 
