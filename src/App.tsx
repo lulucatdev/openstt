@@ -700,7 +700,9 @@ function App() {
       if (!status.inputMonitoring || status.microphone !== "granted" || !status.accessibility) {
         setShowOnboarding(true);
       }
-    }).catch(() => {});
+    }).catch(() => {
+      setShowOnboarding(true);
+    });
     void (async () => {
       try {
         const settings = await invoke<UiSettings>("get_ui_settings");
