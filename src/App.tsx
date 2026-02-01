@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  Check,
   Database,
   FileText,
   LayoutDashboard,
   Menu,
   Settings,
+  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -75,6 +77,12 @@ type LegacyModelsInfo = {
   found: boolean;
   path: string;
   sizeBytes: number;
+};
+
+type PermissionStatus = {
+  accessibility: boolean;
+  microphone: string;
+  inputMonitoring: boolean;
 };
 
 type LogEntry = {
@@ -336,6 +344,22 @@ const translations = {
     legacyNotFound: "No legacy files found",
     legacyClean: "Clean up",
     legacyCleaning: "Cleaning...",
+    onboardingTitle: "Welcome to OpenSTT",
+    onboardingSubtitle: "Grant permissions to enable all features",
+    onboardingInputMonitoring: "Input Monitoring",
+    onboardingInputMonitoringDesc: "Required for global keyboard shortcut",
+    onboardingMicrophone: "Microphone",
+    onboardingMicrophoneDesc: "Required to record audio for transcription",
+    onboardingAccessibility: "Accessibility",
+    onboardingAccessibilityDesc: "Required for auto-paste after transcription",
+    onboardingOpenSettings: "Open Settings",
+    onboardingGrantAccess: "Grant Access",
+    onboardingCheckPermission: "Check",
+    onboardingGranted: "Granted",
+    onboardingRestartApp: "Restart App",
+    onboardingSkip: "Set up later",
+    onboardingAllDone: "All permissions granted!",
+    stopDictation: "Stop",
   },
   zh: {
     appName: "OpenSTT",
@@ -481,6 +505,22 @@ const translations = {
     legacyNotFound: "未发现遗留文件",
     legacyClean: "清理",
     legacyCleaning: "清理中...",
+    onboardingTitle: "欢迎使用 OpenSTT",
+    onboardingSubtitle: "授予权限以启用所有功能",
+    onboardingInputMonitoring: "输入监控",
+    onboardingInputMonitoringDesc: "全局快捷键需要此权限",
+    onboardingMicrophone: "麦克风",
+    onboardingMicrophoneDesc: "录音转写需要此权限",
+    onboardingAccessibility: "辅助功能",
+    onboardingAccessibilityDesc: "转写后自动粘贴需要此权限",
+    onboardingOpenSettings: "打开设置",
+    onboardingGrantAccess: "授予权限",
+    onboardingCheckPermission: "检查",
+    onboardingGranted: "已授权",
+    onboardingRestartApp: "重启应用",
+    onboardingSkip: "稍后设置",
+    onboardingAllDone: "所有权限已授予！",
+    stopDictation: "停止",
   },
 } as const;
 
@@ -526,6 +566,8 @@ function App() {
   const [legacyModels, setLegacyModels] = useState<LegacyModelsInfo | null>(null);
   const [legacyAction, setLegacyAction] = useState<"cleaning" | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [permissionStatus, setPermissionStatus] = useState<PermissionStatus | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [modelAction, setModelAction] = useState<{
@@ -653,6 +695,12 @@ function App() {
     void refreshModels();
     void refreshMlxDeps();
     void invoke<LegacyModelsInfo>("check_legacy_models").then(setLegacyModels).catch(() => {});
+    void invoke<PermissionStatus>("check_all_permissions").then((status) => {
+      setPermissionStatus(status);
+      if (!status.inputMonitoring || status.microphone !== "granted" || !status.accessibility) {
+        setShowOnboarding(true);
+      }
+    }).catch(() => {});
     void (async () => {
       try {
         const settings = await invoke<UiSettings>("get_ui_settings");
@@ -1149,6 +1197,22 @@ function App() {
     }
   };
 
+  const refreshPermissions = async () => {
+    try {
+      const status = await invoke<PermissionStatus>("check_all_permissions");
+      setPermissionStatus(status);
+      return status;
+    } catch {
+      return null;
+    }
+  };
+
+  const allPermissionsGranted = permissionStatus
+    ? permissionStatus.inputMonitoring &&
+      permissionStatus.microphone === "granted" &&
+      permissionStatus.accessibility
+    : false;
+
   return (
     <div
       className={`app ${
@@ -1211,6 +1275,15 @@ function App() {
                 <div className={`status-pill is-${dictationState === "idle" ? (mlxReady ? "ready" : "loading") : dictationState === "listening" ? "listening" : "transcribing"}`}>
                   <span className="status-dot" />
                   {t("dictationTitle")}: {dictationState === "idle" ? (mlxReady ? t("dictationIdle") : t("runtimeMissing")) : dictationState === "listening" ? t("dictationListening") : t("dictationProcessing")}
+                  {dictationState !== "idle" && (
+                    <button
+                      className="stop-button-inline"
+                      onClick={() => invoke("stop_dictation")}
+                      aria-label={t("stopDictation")}
+                    >
+                      <Square size={8} fill="currentColor" />
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="sidebar-meta">
@@ -1268,6 +1341,14 @@ function App() {
           </div>
 
           <div className="content-body">
+            {error && (
+              <div className="error-banner global-error">
+                <span>{error}</span>
+                <button className="error-dismiss" onClick={() => setError(null)} aria-label="Dismiss">
+                  <X size={12} strokeWidth={2} />
+                </button>
+              </div>
+            )}
             {activePage === "overview" && (
               <>
                 {/* MLX Runtime */}
@@ -1543,7 +1624,6 @@ function App() {
                     </div>
                   </div>
 
-                  {error && <div className="error-banner">{error}</div>}
                   {permissionError === "microphone" && (
                     <div className="error-banner permission-error">
                       <span>{t("microphonePermissionDenied")}</span>
@@ -2194,6 +2274,143 @@ function App() {
         className="drawer-scrim"
         onClick={() => setDrawerOpen(false)}
       />
+
+      {showOnboarding && (
+        <div className="onboarding-overlay">
+          <div className="onboarding-dialog">
+            <h2 className="onboarding-title">{t("onboardingTitle")}</h2>
+            <p className="onboarding-subtitle">{t("onboardingSubtitle")}</p>
+
+            <div className="onboarding-steps">
+              {/* Step 1: Input Monitoring */}
+              <div className={`onboarding-step ${permissionStatus?.inputMonitoring ? "is-granted" : ""}`}>
+                <div className="onboarding-step-header">
+                  <div className="onboarding-step-number">1</div>
+                  <div>
+                    <div className="onboarding-step-title">{t("onboardingInputMonitoring")}</div>
+                    <div className="onboarding-step-desc">{t("onboardingInputMonitoringDesc")}</div>
+                  </div>
+                  {permissionStatus?.inputMonitoring && (
+                    <span className="onboarding-check"><Check size={14} /></span>
+                  )}
+                </div>
+                {!permissionStatus?.inputMonitoring && (
+                  <div className="onboarding-step-actions">
+                    <button
+                      className="button tiny primary"
+                      onClick={() => invoke("open_permission_settings", { target: "input_monitoring" })}
+                    >
+                      {t("onboardingOpenSettings")}
+                    </button>
+                    <button
+                      className="button tiny"
+                      onClick={refreshPermissions}
+                    >
+                      {t("onboardingCheckPermission")}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Step 2: Microphone */}
+              <div className={`onboarding-step ${permissionStatus?.microphone === "granted" ? "is-granted" : ""}`}>
+                <div className="onboarding-step-header">
+                  <div className="onboarding-step-number">2</div>
+                  <div>
+                    <div className="onboarding-step-title">{t("onboardingMicrophone")}</div>
+                    <div className="onboarding-step-desc">{t("onboardingMicrophoneDesc")}</div>
+                  </div>
+                  {permissionStatus?.microphone === "granted" && (
+                    <span className="onboarding-check"><Check size={14} /></span>
+                  )}
+                </div>
+                {permissionStatus?.microphone !== "granted" && (
+                  <div className="onboarding-step-actions">
+                    {permissionStatus?.microphone === "denied" ? (
+                      <button
+                        className="button tiny primary"
+                        onClick={() => invoke("open_permission_settings", { target: "microphone" })}
+                      >
+                        {t("onboardingOpenSettings")}
+                      </button>
+                    ) : (
+                      <button
+                        className="button tiny primary"
+                        onClick={async () => {
+                          try {
+                            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                            stream.getTracks().forEach((track) => track.stop());
+                          } catch { /* user denied */ }
+                          await refreshPermissions();
+                        }}
+                      >
+                        {t("onboardingGrantAccess")}
+                      </button>
+                    )}
+                    <button
+                      className="button tiny"
+                      onClick={refreshPermissions}
+                    >
+                      {t("onboardingCheckPermission")}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Step 3: Accessibility */}
+              <div className={`onboarding-step ${permissionStatus?.accessibility ? "is-granted" : ""}`}>
+                <div className="onboarding-step-header">
+                  <div className="onboarding-step-number">3</div>
+                  <div>
+                    <div className="onboarding-step-title">{t("onboardingAccessibility")}</div>
+                    <div className="onboarding-step-desc">{t("onboardingAccessibilityDesc")}</div>
+                  </div>
+                  {permissionStatus?.accessibility && (
+                    <span className="onboarding-check"><Check size={14} /></span>
+                  )}
+                </div>
+                {!permissionStatus?.accessibility && (
+                  <div className="onboarding-step-actions">
+                    <button
+                      className="button tiny primary"
+                      onClick={() => invoke("open_permission_settings", { target: "accessibility" })}
+                    >
+                      {t("onboardingOpenSettings")}
+                    </button>
+                    <button
+                      className="button tiny"
+                      onClick={refreshPermissions}
+                    >
+                      {t("onboardingCheckPermission")}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="onboarding-footer">
+              {allPermissionsGranted ? (
+                <>
+                  <div className="onboarding-all-done">{t("onboardingAllDone")}</div>
+                  <button
+                    className="button primary"
+                    onClick={() => invoke("restart_app")}
+                  >
+                    {t("onboardingRestartApp")}
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="button ghost"
+                  onClick={() => setShowOnboarding(false)}
+                >
+                  {t("onboardingSkip")}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

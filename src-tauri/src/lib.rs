@@ -12,6 +12,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use flate2::read::GzDecoder;
+use tar::Archive;
 use std::{
     io::BufRead,
     process::Stdio,
@@ -90,6 +92,19 @@ const TRAY_STOP: &str = "tray-stop";
 const TRAY_SETTINGS: &str = "tray-settings";
 const TRAY_LOGS: &str = "tray-logs";
 const TRAY_QUIT: &str = "tray-quit";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionStatus {
+    accessibility: bool,
+    microphone: String,
+    input_monitoring: bool,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -865,6 +880,18 @@ fn mlx_sidecar_script() -> PathBuf {
         .join("mlx_stt.py")
 }
 
+const STANDALONE_PYTHON_URL: &str =
+    "https://github.com/astral-sh/python-build-standalone/releases/download/\
+     20260127/cpython-3.12.12+20260127-aarch64-apple-darwin-install_only.tar.gz";
+
+fn standalone_python_dir() -> PathBuf {
+    openstt_dir().join("python")
+}
+
+fn standalone_python_path() -> PathBuf {
+    standalone_python_dir().join("bin").join("python3")
+}
+
 fn python_command() -> String {
     if let Ok(path) = std::env::var("OPENSTT_PYTHON") {
         return path;
@@ -873,14 +900,9 @@ fn python_command() -> String {
     if venv_python.exists() {
         return venv_python.to_string_lossy().to_string();
     }
-    "python3".to_string()
-}
-
-fn base_python_command() -> String {
-    if let Ok(path) = std::env::var("OPENSTT_PYTHON") {
-        if Path::new(&path).exists() {
-            return path;
-        }
+    let standalone = standalone_python_path();
+    if standalone.exists() {
+        return standalone.to_string_lossy().to_string();
     }
     "python3".to_string()
 }
@@ -952,12 +974,110 @@ async fn mlx_dependency_status(state: TauriState<'_, AppState>) -> Result<MlxDep
     Ok(status)
 }
 
+async fn download_standalone_python(logs: &LogStore) -> Result<(), String> {
+    let python_dir = standalone_python_dir();
+    // Clean up partial install if binary is missing
+    if python_dir.exists() && !standalone_python_path().exists() {
+        tokio::fs::remove_dir_all(&python_dir)
+            .await
+            .map_err(|e| format!("Failed to remove partial python dir: {e}"))?;
+    }
+
+    logs.push("info", "Downloading standalone Python…").await;
+
+    let response = reqwest::get(STANDALONE_PYTHON_URL)
+        .await
+        .map_err(|e| format!("Failed to download Python: {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to download Python: HTTP {}",
+            response.status()
+        ));
+    }
+
+    let total_size = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut data: Vec<u8> = Vec::new();
+    let mut last_log = Instant::now();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download error: {e}"))?;
+        data.extend_from_slice(&chunk);
+        if last_log.elapsed() >= std::time::Duration::from_secs(2) {
+            last_log = Instant::now();
+            if let Some(total) = total_size {
+                let pct = (data.len() as f64 / total as f64 * 100.0) as u32;
+                logs.push("info", format!("Downloading Python: {pct}%")).await;
+            } else {
+                logs.push(
+                    "info",
+                    format!("Downloading Python: {} MB", data.len() / (1024 * 1024)),
+                )
+                .await;
+            }
+        }
+    }
+
+    logs.push("info", "Extracting Python…").await;
+
+    let target_dir = openstt_dir();
+    tokio::task::spawn_blocking(move || {
+        let decoder = GzDecoder::new(&data[..]);
+        let mut archive = Archive::new(decoder);
+        archive
+            .unpack(&target_dir)
+            .map_err(|e| format!("Failed to extract Python: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Extract task failed: {e}"))??;
+
+    if !standalone_python_path().exists() {
+        return Err("Python extraction succeeded but binary not found".to_string());
+    }
+
+    logs.push("info", "Standalone Python installed").await;
+    Ok(())
+}
+
+async fn ensure_python(state: &AppState) -> Result<String, String> {
+    // 1. OPENSTT_PYTHON env override
+    if let Ok(path) = std::env::var("OPENSTT_PYTHON") {
+        if Path::new(&path).exists() {
+            return Ok(path);
+        }
+    }
+
+    // 2. Already-downloaded standalone python
+    let standalone = standalone_python_path();
+    if standalone.exists() {
+        return Ok(standalone.to_string_lossy().to_string());
+    }
+
+    // 3. System python3
+    let system_ok = Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if system_ok {
+        return Ok("python3".to_string());
+    }
+
+    // 4. Download standalone python
+    download_standalone_python(&state.logs).await?;
+    Ok(standalone_python_path().to_string_lossy().to_string())
+}
+
 #[tauri::command]
 async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<MlxDependencyStatus, String> {
     if !mlx_supported() {
         return Err("MLX runtime requires Apple Silicon".to_string());
     }
-    let base_python = base_python_command();
+    let base_python = ensure_python(&state).await?;
     let venv = venv_dir();
     if !venv.exists() {
         let status = Command::new(&base_python)
@@ -968,7 +1088,7 @@ async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<Mlx
             .await
             .map_err(|err| format!("Failed to create venv: {err}"))?;
         if !status.success() {
-            return Err("Failed to create venv".to_string());
+            return Err("Failed to create Python venv. Make sure python3 has the venv module installed.".to_string());
         }
     }
 
@@ -1597,6 +1717,91 @@ async fn stop_server_inner(app_state: AppState) -> Result<ServerStatus, String> 
     refresh_tray(&app_state).await;
     emit_app_status(&app_state, AppStatus::Stopped).await;
     Ok(build_status(&app_state).await)
+}
+
+#[cfg(target_os = "macos")]
+fn check_accessibility() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_accessibility() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+async fn check_microphone() -> String {
+    let output = Command::new("swift")
+        .arg("-e")
+        .arg("import AVFoundation; let s = AVCaptureDevice.authorizationStatus(for: .audio); switch s { case .authorized: print(\"granted\"); case .denied, .restricted: print(\"denied\"); default: print(\"not_determined\") }")
+        .output()
+        .await;
+    match output {
+        Ok(out) => {
+            let result = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if result == "granted" || result == "denied" || result == "not_determined" {
+                result
+            } else {
+                "not_determined".to_string()
+            }
+        }
+        Err(_) => "not_determined".to_string(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn check_microphone() -> String {
+    "granted".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn check_input_monitoring() -> bool {
+    let tap = CGEventTap::new(
+        CGEventTapLocation::HID,
+        CGEventTapPlacement::HeadInsertEventTap,
+        CGEventTapOptions::ListenOnly,
+        vec![CGEventType::KeyDown],
+        |_proxy, _event_type, event| Some(event.clone()),
+    );
+    tap.is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_input_monitoring() -> bool {
+    true
+}
+
+#[tauri::command]
+async fn check_all_permissions() -> Result<PermissionStatus, String> {
+    let accessibility = check_accessibility();
+    let input_monitoring = check_input_monitoring();
+    let microphone = check_microphone().await;
+    Ok(PermissionStatus {
+        accessibility,
+        microphone,
+        input_monitoring,
+    })
+}
+
+#[tauri::command]
+async fn open_permission_settings(target: String) -> Result<(), String> {
+    let url = match target.as_str() {
+        "input_monitoring" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
+        "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+        "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        _ => return Err(format!("Unknown permission target: {target}")),
+    };
+    Command::new("open")
+        .arg(url)
+        .output()
+        .await
+        .map_err(|err| format!("Failed to open settings: {err}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.restart();
 }
 
 #[tauri::command]
@@ -2694,18 +2899,25 @@ pub fn run() {
                 }
             });
 
-            // Spawn 100ms ticker to update tray timer during active dictation phases
+            // Spawn 100ms ticker to update tray title during active dictation phases
             tauri::async_runtime::spawn({
                 let state_for_ticker = (*state).clone();
                 async move {
                     loop {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        let is_active = {
-                            let tray = state_for_ticker.dictation_tray_state.lock().await;
-                            tray.state != "idle"
-                        };
-                        if is_active {
-                            refresh_tray(&state_for_ticker).await;
+                        let dictation = state_for_ticker.dictation_tray_state.lock().await.clone();
+                        if dictation.state == "idle" {
+                            continue;
+                        }
+                        let elapsed = dictation.phase_started.map(|started| {
+                            format!("{:.1}s", started.elapsed().as_secs_f64())
+                        });
+                        let title = format_dictation_state(&dictation.state, &elapsed);
+                        let app_handle = state_for_ticker.app_handle.lock().await.clone();
+                        if let Some(app_handle) = app_handle {
+                            if let Some(tray) = app_handle.tray_by_id(TRAY_ID) {
+                                let _ = tray.set_title(Some(&title));
+                            }
                         }
                     }
                 }
@@ -2779,7 +2991,10 @@ pub fn run() {
             get_active_model,
             set_active_model,
             check_legacy_models,
-            clean_legacy_models
+            clean_legacy_models,
+            check_all_permissions,
+            open_permission_settings,
+            restart_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

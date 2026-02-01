@@ -32,6 +32,8 @@ symphonia = { version = "0.5", features = ["aac", "alac", "flac", "mp3", "wav", 
 whisper-rs = { version = "0.12", features = ["metal"] }
 cpal = "0.15"
 arboard = "3"
+flate2 = "1"
+tar = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
