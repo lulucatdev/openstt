@@ -46,3 +46,6 @@ src-tauri/Cargo.lock
 # Release
 release-guide.md
 releases/
+
+# env
+.env

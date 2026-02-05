@@ -30,6 +30,7 @@ type UiSettings = {
   language: "en" | "zh";
   dictationShortcut: DictationShortcut;
   dictationAutoPaste: boolean;
+  elevenlabsApiKey: string;
 };
 
 type DictationShortcut = {
@@ -210,7 +211,7 @@ const translations = {
     pageLogs: "Logs",
     pageSettings: "Settings",
     pageOverviewDesc: "Service control and API surface",
-    pageModelsDesc: "Download and activate Whisper models",
+    pageModelsDesc: "Manage speech-to-text models",
     pageLogsDesc: "Recent gateway activity",
     pageSettingsDesc: "Preferences and accessibility",
     running: "Running",
@@ -241,7 +242,7 @@ const translations = {
     copied: "Copied",
     copy: "Copy",
     modelsTitle: "Models",
-    modelsDesc: "Manage local models",
+    modelsDesc: "Manage speech-to-text models",
     noModels: "No models available yet.",
     active: "Active",
     activate: "Activate",
@@ -280,6 +281,19 @@ const translations = {
     mlxModels: "MLX Models",
     mlxRecommendation: "MLX models run faster on Apple Silicon. Switch to MLX Models tab for better performance.",
     switchToMlx: "Switch to MLX",
+    cloudModels: "Cloud Models",
+    elevenlabsApiKey: "ElevenLabs API Key",
+    elevenlabsApiKeyHint: "Required for cloud transcription",
+    elevenlabsApiKeyPlaceholder: "Enter your API key",
+    testApiKey: "Test",
+    testingApiKey: "Testing...",
+    apiKeyValid: "Valid",
+    apiKeyInvalid: "Invalid",
+    apiKeyNotSet: "Not configured",
+    apiKeyNotVerified: "Not verified",
+    getApiKey: "Get API Key",
+    scribeV2: "Scribe v2",
+    scribeV2Desc: "Best quality batch transcription, 90+ languages",
     appearance: "Appearance",
     reducedTransparency: "Reduced transparency",
     reducedTransparencyHint: "Use solid surfaces for better contrast",
@@ -379,7 +393,7 @@ const translations = {
     pageLogs: "日志",
     pageSettings: "设置",
     pageOverviewDesc: "服务控制与 API 概览",
-    pageModelsDesc: "下载并激活 Whisper 模型",
+    pageModelsDesc: "管理语音转文字模型",
     pageLogsDesc: "网关最近活动",
     pageSettingsDesc: "偏好设置与辅助选项",
     running: "运行中",
@@ -410,7 +424,7 @@ const translations = {
     copied: "已复制",
     copy: "复制",
     modelsTitle: "模型",
-    modelsDesc: "管理本地模型",
+    modelsDesc: "管理语音转文字模型",
     noModels: "暂无可用模型。",
     active: "已启用",
     activate: "启用",
@@ -449,6 +463,19 @@ const translations = {
     mlxModels: "MLX 模型",
     mlxRecommendation: "MLX 模型在 Apple Silicon 上运行更快。切换到 MLX 模型以获得更好的性能。",
     switchToMlx: "切换到 MLX",
+    cloudModels: "云端模型",
+    elevenlabsApiKey: "ElevenLabs API 密钥",
+    elevenlabsApiKeyHint: "云端转写需要此密钥",
+    elevenlabsApiKeyPlaceholder: "输入您的 API 密钥",
+    testApiKey: "测试",
+    testingApiKey: "测试中...",
+    apiKeyValid: "有效",
+    apiKeyInvalid: "无效",
+    apiKeyNotSet: "未配置",
+    apiKeyNotVerified: "未验证",
+    getApiKey: "获取密钥",
+    scribeV2: "Scribe v2",
+    scribeV2Desc: "最佳质量批量转写，支持90+语言",
     appearance: "外观",
     reducedTransparency: "减少透明度",
     reducedTransparencyHint: "使用更实的表面以提升对比度",
@@ -558,6 +585,7 @@ function App() {
     language: detectSystemLanguage(),
     dictationShortcut: defaultDictationShortcut,
     dictationAutoPaste: true,
+    elevenlabsApiKey: "",
   });
   const [dictationCapture, setDictationCapture] = useState(false);
   const [dictationState, setDictationState] = useState<
@@ -574,13 +602,16 @@ function App() {
   >("overview");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [modelsEditing, setModelsEditing] = useState(false);
-  const [modelsTab, setModelsTab] = useState<"whisper" | "mlx-local">(
+  const [modelsTab, setModelsTab] = useState<"whisper" | "mlx-local" | "cloud">(
     "mlx-local",
   );
   const [mlxDeps, setMlxDeps] = useState<MlxDependencyStatus | null>(null);
   const [mlxAction, setMlxAction] = useState<
     "install" | "setup" | "reset" | null
   >(null);
+  const [elevenlabsKeyStatus, setElevenlabsKeyStatus] = useState<
+    "unknown" | "testing" | "valid" | "invalid"
+  >("unknown");
   const [legacyModels, setLegacyModels] = useState<LegacyModelsInfo | null>(null);
   const [legacyAction, setLegacyAction] = useState<"cleaning" | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
@@ -819,6 +850,18 @@ function App() {
   const mlxLocalModels = models.filter(
     (model) => model.engine !== "whisper",
   );
+  const cloudModels = [
+    {
+      id: "elevenlabs:scribe_v2",
+      name: t("scribeV2"),
+      size: "Cloud",
+      description: t("scribeV2Desc"),
+      engine: "elevenlabs",
+      downloaded: true,
+      downloadUrl: "",
+      localPath: null,
+    },
+  ];
 
   useEffect(() => {
     if (activePage !== "models") {
@@ -1202,6 +1245,22 @@ function App() {
     }
   };
 
+  const handleTestElevenlabsKey = async () => {
+    setElevenlabsKeyStatus("testing");
+    try {
+      const valid = await invoke<boolean>("test_elevenlabs_api_key", {
+        apiKey: uiSettings.elevenlabsApiKey,
+      });
+      setElevenlabsKeyStatus(valid ? "valid" : "invalid");
+      if (valid) {
+        // Save settings only after successful test
+        await invoke("set_ui_settings", { settings: uiSettings });
+      }
+    } catch {
+      setElevenlabsKeyStatus("invalid");
+    }
+  };
+
   const handleActivateModel = async (modelId: string) => {
     setError(null);
     setModelAction({ id: modelId, type: "activate" });
@@ -1309,7 +1368,7 @@ function App() {
                 </div>
                 <div className={`status-pill is-${dictationState === "idle" ? (mlxReady ? "ready" : "loading") : dictationState === "listening" ? "listening" : "transcribing"}`}>
                   <span className="status-dot" />
-                  {t("dictationTitle")}: {dictationState === "idle" ? (mlxReady ? t("dictationIdle") : t("runtimeMissing")) : dictationState === "listening" ? t("dictationListening") : t("dictationProcessing")}
+                  {dictationState === "idle" ? (mlxReady ? t("dictationIdle") : t("runtimeMissing")) : dictationState === "listening" ? t("dictationListening") : t("dictationProcessing")}
                   {dictationState !== "idle" && (
                     <button
                       className="stop-button-inline"
@@ -1749,6 +1808,14 @@ function App() {
                   >
                     {t("whisperModels")}
                   </button>
+                  <button
+                    className={`model-tab ${
+                      modelsTab === "cloud" ? "is-active" : ""
+                    }`}
+                    onClick={() => setModelsTab("cloud")}
+                  >
+                    {t("cloudModels")}
+                  </button>
                 </div>
 
                 {modelsTab === "mlx-local" && mlxLocalModels.length > 0 && (
@@ -1796,7 +1863,93 @@ function App() {
                   </div>
                 )}
 
-                <div className="model-section">
+                {modelsTab === "cloud" ? (
+                  <div className="model-section">
+                    <div className="section-title">{t("cloudModels")}</div>
+                    <div className="runtime-row" style={{ marginBottom: 12 }}>
+                      <div style={{ flex: 1 }}>
+                        <div className="runtime-title">{t("elevenlabsApiKey")}</div>
+                        <div className="muted">{t("elevenlabsApiKeyHint")}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input
+                          type="password"
+                          className="input"
+                          placeholder={t("elevenlabsApiKeyPlaceholder")}
+                          value={uiSettings.elevenlabsApiKey}
+                          onChange={(e) => {
+                            const updated = { ...uiSettings, elevenlabsApiKey: e.target.value };
+                            setUiSettings(updated);
+                            setElevenlabsKeyStatus("unknown");
+                          }}
+                          style={{ width: 220 }}
+                        />
+                        <button
+                          className="button tiny"
+                          onClick={handleTestElevenlabsKey}
+                          disabled={!uiSettings.elevenlabsApiKey || elevenlabsKeyStatus === "testing"}
+                        >
+                          {elevenlabsKeyStatus === "testing" ? t("testingApiKey") : t("testApiKey")}
+                        </button>
+                        <span
+                          className={`runtime-status ${
+                            elevenlabsKeyStatus === "valid"
+                              ? "is-ready"
+                              : elevenlabsKeyStatus === "invalid"
+                                ? "is-missing"
+                                : ""
+                          }`}
+                        >
+                          {elevenlabsKeyStatus === "valid"
+                            ? t("apiKeyValid")
+                            : elevenlabsKeyStatus === "invalid"
+                              ? t("apiKeyInvalid")
+                              : elevenlabsKeyStatus === "testing"
+                                ? t("testingApiKey")
+                                : uiSettings.elevenlabsApiKey
+                                  ? t("apiKeyNotVerified")
+                                  : t("apiKeyNotSet")}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="model-list">
+                      {cloudModels.map((model) => {
+                        const isActive = model.id === activeModelId;
+                        const isActivating =
+                          modelAction?.id === model.id && modelAction.type === "activate";
+                        const hasApiKey = Boolean(uiSettings.elevenlabsApiKey);
+                        return (
+                          <div
+                            key={model.id}
+                            className={`model-row ${isActive ? "is-active" : ""}`}
+                          >
+                            <div className="model-info">
+                              <div className="model-title">
+                                <span>{model.name}</span>
+                                <span className="model-size">{model.size}</span>
+                              </div>
+                              <div className="model-desc">{model.description}</div>
+                            </div>
+                            <div className="model-actions">
+                              {isActive ? (
+                                <span className="pill">{t("active")}</span>
+                              ) : (
+                                <button
+                                  className="button tiny"
+                                  onClick={() => handleActivateModel(model.id)}
+                                  disabled={Boolean(modelAction) || !hasApiKey}
+                                >
+                                  {isActivating ? t("activating") : t("activate")}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="model-section">
                     <div className="section-title">
                       {modelsTab === "whisper"
                         ? t("whisperModels")
@@ -1915,6 +2068,7 @@ function App() {
                       )}
                     </div>
                   </div>
+                )}
               </div>
             )}
 

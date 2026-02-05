@@ -208,6 +208,7 @@ struct UiSettings {
     language: String,
     dictation_shortcut: DictationShortcut,
     dictation_auto_paste: bool,
+    elevenlabs_api_key: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -233,6 +234,7 @@ impl Default for UiSettings {
             language: "en".to_string(),
             dictation_shortcut: DictationShortcut::default(),
             dictation_auto_paste: true,
+            elevenlabs_api_key: String::new(),
         }
     }
 }
@@ -1408,6 +1410,56 @@ async fn mlx_transcribe(
     Ok(payload.text)
 }
 
+#[derive(Deserialize)]
+struct ElevenLabsResponse {
+    text: String,
+}
+
+async fn elevenlabs_transcribe(
+    api_key: &str,
+    audio_bytes: &[u8],
+    language: Option<&str>,
+) -> Result<String, TranscribeError> {
+    let client = reqwest::Client::new();
+
+    let mut form = reqwest::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .unwrap(),
+        )
+        .text("model_id", "scribe_v2");
+
+    if let Some(lang) = language {
+        form = form.text("language_code", lang.to_string());
+    }
+
+    let response = client
+        .post("https://api.elevenlabs.io/v1/speech-to-text")
+        .header("xi-api-key", api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    if !response.status().is_success() {
+        let error = response.text().await.unwrap_or_default();
+        return Err(TranscribeError::internal(format!(
+            "ElevenLabs API error: {}",
+            error
+        )));
+    }
+
+    let result: ElevenLabsResponse = response
+        .json()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    Ok(result.text)
+}
+
 pub(crate) async fn transcribe_bytes(
     state: &AppState,
     model: Option<String>,
@@ -1433,6 +1485,36 @@ pub(crate) async fn transcribe_bytes(
         state.active_model_id.lock().await.clone()
     };
     let model_id = normalize_model_id(&selected_model);
+
+    // Handle ElevenLabs cloud models
+    if model_id.starts_with("elevenlabs:") {
+        let file_label = file_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let size_label = file_bytes.len().to_string();
+        state
+            .logs
+            .push(
+                "info",
+                format!(
+                    "Transcription request model={model_id} file={file_label} bytes={size_label}"
+                ),
+            )
+            .await;
+
+        let api_key = state.ui_settings.lock().await.elevenlabs_api_key.clone();
+        if api_key.is_empty() {
+            let message = "ElevenLabs API key not configured".to_string();
+            state.logs.push("error", message.clone()).await;
+            return Err(TranscribeError::bad_request(message));
+        }
+
+        let text = elevenlabs_transcribe(&api_key, &file_bytes, language.as_deref()).await?;
+        state
+            .logs
+            .push("info", format!("Transcription complete: {} chars", text.len()))
+            .await;
+        return Ok(text);
+    }
+
     let entry = match models::model_entry(&model_id) {
         Some(entry) => entry,
         None => {
@@ -1806,6 +1888,56 @@ async fn open_permission_settings(target: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn test_elevenlabs_api_key(api_key: String) -> Result<bool, String> {
+    // Create a minimal valid WAV file (44 bytes header + 2 bytes of silence)
+    let wav_header: [u8; 46] = [
+        0x52, 0x49, 0x46, 0x46, // "RIFF"
+        0x26, 0x00, 0x00, 0x00, // File size - 8 (38 bytes)
+        0x57, 0x41, 0x56, 0x45, // "WAVE"
+        0x66, 0x6D, 0x74, 0x20, // "fmt "
+        0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
+        0x01, 0x00,             // AudioFormat (1 = PCM)
+        0x01, 0x00,             // NumChannels (1 = mono)
+        0x80, 0x3E, 0x00, 0x00, // SampleRate (16000)
+        0x00, 0x7D, 0x00, 0x00, // ByteRate (32000)
+        0x02, 0x00,             // BlockAlign (2)
+        0x10, 0x00,             // BitsPerSample (16)
+        0x64, 0x61, 0x74, 0x61, // "data"
+        0x02, 0x00, 0x00, 0x00, // Subchunk2Size (2 bytes)
+        0x00, 0x00,             // 1 sample of silence
+    ];
+
+    let client = reqwest::Client::new();
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(wav_header.to_vec())
+                .file_name("test.wav")
+                .mime_str("audio/wav")
+                .unwrap(),
+        )
+        .text("model_id", "scribe_v2");
+
+    let response = client
+        .post("https://api.elevenlabs.io/v1/speech-to-text")
+        .header("xi-api-key", &api_key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 200 = success, 422 = audio too short (but key is valid)
+    // 401 = invalid key or missing permissions
+    if response.status().is_success() || response.status().as_u16() == 422 {
+        return Ok(true);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    // If we get "invalid_api_key" or "missing_permissions", key is not valid for STT
+    Ok(!body.contains("invalid_api_key") && !body.contains("missing_permissions"))
+}
+
+#[tauri::command]
 async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     app.restart();
 }
@@ -2086,7 +2218,9 @@ async fn set_active_model(
     model_id: String,
 ) -> Result<String, String> {
     let model_id = normalize_model_id(&model_id);
-    if models::model_entry(&model_id).is_none() {
+    // Allow ElevenLabs cloud models or catalog models
+    let is_elevenlabs = model_id.starts_with("elevenlabs:");
+    if !is_elevenlabs && models::model_entry(&model_id).is_none() {
         return Err(format!("Unknown model: {model_id}"));
     }
     *state.active_model_id.lock().await = model_id.clone();
@@ -3000,7 +3134,8 @@ pub fn run() {
             clean_legacy_models,
             check_all_permissions,
             open_permission_settings,
-            restart_app
+            restart_app,
+            test_elevenlabs_api_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
