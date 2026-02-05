@@ -1,5 +1,6 @@
 mod audio;
 mod dictation;
+pub mod elevenlabs_realtime;
 mod models;
 mod recording;
 
@@ -10,24 +11,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use flate2::read::GzDecoder;
-use tar::Archive;
-use std::{
-    io::BufRead,
-    process::Stdio,
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
-use tauri::{Emitter, Manager, State as TauriState};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 #[cfg(target_os = "macos")]
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 #[cfg(target_os = "macos")]
@@ -35,13 +18,33 @@ use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, EventField, KeyCode,
 };
+use flate2::read::GzDecoder;
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::{
+    io::BufRead,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use tar::Archive;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, State as TauriState};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,
     sync::{oneshot, Mutex},
     time::{sleep, Duration},
 };
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -295,7 +298,6 @@ struct TranscribeAudioRequest {
     language: Option<String>,
 }
 
-
 impl LogStore {
     fn new(max_entries: usize) -> Self {
         Self {
@@ -470,8 +472,8 @@ fn parse_dictation_shortcut(shortcut: &DictationShortcut) -> Result<Shortcut, St
     } else {
         shortcut.key.trim()
     };
-    let key = Code::from_str(key_value)
-        .map_err(|_| format!("Unknown shortcut key: {key_value}"))?;
+    let key =
+        Code::from_str(key_value).map_err(|_| format!("Unknown shortcut key: {key_value}"))?;
     let mut mods = Modifiers::empty();
     for modifier in &shortcut.modifiers {
         match modifier.trim().to_lowercase().as_str() {
@@ -540,7 +542,8 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                 let Some((target_key, target_flag)) = modifier_keycode_and_flag(&shortcut) else {
                     return Some(event.clone());
                 };
-                let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                let keycode =
+                    event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                 if keycode != target_key {
                     return Some(event.clone());
                 }
@@ -549,50 +552,32 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                 let app_state = state.clone();
                 let app_handle = app.clone();
                 if is_down {
-                    if let Err(err) = app_state.dictation.start_recording() {
-                        let logs = app_state.logs.clone();
-                        tauri::async_runtime::spawn(async move {
-                            logs.push("error", format!("Dictation start failed: {err}")).await;
-                        });
-                    } else {
-                        tauri::async_runtime::spawn(async move {
-                            app_state.dictation.emit_state(&app_handle).await;
-                            let mut tray = app_state.dictation_tray_state.lock().await;
-                            tray.state = "listening".to_string();
-                            tray.queue_len = app_state.dictation.queue_len().await;
-                            tray.phase_started = Some(Instant::now());
-                            drop(tray);
-                            refresh_tray(&app_state).await;
-                            recompute_and_emit_app_status(&app_state).await;
-                        });
-                    }
-                } else {
                     tauri::async_runtime::spawn(async move {
-                        let _ = app_state.dictation.stop_recording().await;
+                        if let Err(err) = start_dictation_inner(&app_state, &app_handle).await {
+                            app_state
+                                .logs
+                                .push("error", format!("Dictation start failed: {err}"))
+                                .await;
+                            return;
+                        }
                         app_state.dictation.emit_state(&app_handle).await;
-                        let has_queue = app_state.dictation.queue_len().await > 0;
-                        {
-                            let mut tray = app_state.dictation_tray_state.lock().await;
-                            if has_queue {
-                                tray.state = "processing".to_string();
-                                tray.phase_started = Some(Instant::now());
-                            } else {
-                                tray.state = "idle".to_string();
-                                tray.phase_started = None;
-                            }
-                            tray.queue_len = app_state.dictation.queue_len().await;
-                        }
+                        let mut tray = app_state.dictation_tray_state.lock().await;
+                        tray.state = "listening".to_string();
+                        tray.queue_len = app_state.dictation.queue_len().await;
+                        tray.phase_started = Some(Instant::now());
+                        drop(tray);
                         refresh_tray(&app_state).await;
                         recompute_and_emit_app_status(&app_state).await;
-                        app_state.dictation.process_queue(&app_state, &app_handle).await;
-                        {
-                            let mut tray = app_state.dictation_tray_state.lock().await;
-                            tray.state = "idle".to_string();
-                            tray.phase_started = None;
-                            tray.queue_len = 0;
+                    });
+                } else {
+                    eprintln!("[lib] modifier event tap: key released");
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(err) = stop_dictation_inner(&app_state, &app_handle).await {
+                            app_state
+                                .logs
+                                .push("error", format!("Dictation stop failed: {err}"))
+                                .await;
                         }
-                        refresh_tray(&app_state).await;
-                        recompute_and_emit_app_status(&app_state).await;
                     });
                 }
                 Some(event.clone())
@@ -654,7 +639,11 @@ fn format_dictation_state(state: &str, elapsed: &Option<String>) -> String {
 }
 
 fn tray_tooltip(snapshot: &TraySnapshot) -> String {
-    let status = if snapshot.running { "Running" } else { "Stopped" };
+    let status = if snapshot.running {
+        "Running"
+    } else {
+        "Stopped"
+    };
     format!("OpenSTT - {status} - {}", snapshot.model_id)
 }
 
@@ -670,8 +659,13 @@ fn build_tray_menu<R: tauri::Runtime>(
         !snapshot.running,
         None::<String>,
     )?;
-    let stop_item =
-        MenuItem::with_id(app, TRAY_STOP, "Stop Gateway", snapshot.running, None::<String>)?;
+    let stop_item = MenuItem::with_id(
+        app,
+        TRAY_STOP,
+        "Stop Gateway",
+        snapshot.running,
+        None::<String>,
+    )?;
     let settings_item =
         MenuItem::with_id(app, TRAY_SETTINGS, "Open Settings", true, None::<String>)?;
     let logs_item = MenuItem::with_id(app, TRAY_LOGS, "Open Logs", true, None::<String>)?;
@@ -703,7 +697,10 @@ fn build_tray_menu<R: tauri::Runtime>(
     let dictation_item = MenuItem::with_id(
         app,
         "tray-dictation",
-        format!("Dictation: {}", format_dictation_state(&snapshot.dictation_state, &snapshot.dictation_elapsed)),
+        format!(
+            "Dictation: {}",
+            format_dictation_state(&snapshot.dictation_state, &snapshot.dictation_elapsed)
+        ),
         false,
         None::<String>,
     )?;
@@ -739,9 +736,9 @@ async fn tray_snapshot(state: &AppState) -> TraySnapshot {
     let port = *state.port.lock().await;
     let model_id = state.active_model_id.lock().await.clone();
     let dictation = state.dictation_tray_state.lock().await.clone();
-    let dictation_elapsed = dictation.phase_started.map(|started| {
-        format!("{:.1}s", started.elapsed().as_secs_f64())
-    });
+    let dictation_elapsed = dictation
+        .phase_started
+        .map(|started| format!("{:.1}s", started.elapsed().as_secs_f64()));
     TraySnapshot {
         running,
         port,
@@ -846,6 +843,92 @@ async fn recompute_and_emit_app_status(state: &AppState) {
     emit_app_status(state, status).await;
 }
 
+fn is_realtime_model(model_id: &str) -> bool {
+    model_id == "elevenlabs:scribe_v2_realtime"
+}
+
+async fn start_dictation_inner(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<(), String> {
+    let model_id = state.active_model_id.lock().await.clone();
+    eprintln!("[lib] start_dictation_inner, model_id: {}", model_id);
+
+    if is_realtime_model(&model_id) {
+        eprintln!("[lib] is realtime model, starting realtime");
+        let settings = state.ui_settings.lock().await;
+        let api_key = settings.elevenlabs_api_key.clone();
+        let language = settings.language.clone();
+        drop(settings);
+
+        if api_key.is_empty() {
+            return Err("ElevenLabs API key not configured".to_string());
+        }
+
+        state
+            .dictation
+            .start_realtime(&api_key, Some(language), app_handle.clone())
+            .await
+    } else {
+        eprintln!("[lib] not realtime model, starting normal recording");
+        state.dictation.start_recording()
+    }
+}
+
+async fn stop_dictation_inner(
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<(), String> {
+    eprintln!("[lib] stop_dictation_inner called");
+    let is_realtime = state.dictation.is_realtime_active().await;
+    eprintln!("[lib] is_realtime_active returned: {}", is_realtime);
+    if is_realtime {
+        eprintln!("[lib] calling stop_realtime");
+        state.dictation.stop_realtime().await?;
+        eprintln!("[lib] stop_realtime completed");
+        // Update UI state
+        state.dictation.emit_state(app_handle).await;
+        {
+            let mut tray = state.dictation_tray_state.lock().await;
+            tray.state = "idle".to_string();
+            tray.phase_started = None;
+            tray.queue_len = 0;
+        }
+        refresh_tray(state).await;
+        recompute_and_emit_app_status(state).await;
+        Ok(())
+    } else {
+        eprintln!("[lib] not realtime, calling stop_recording");
+        state.dictation.stop_recording().await?;
+        // Process queue for non-realtime mode
+        state.dictation.emit_state(app_handle).await;
+        let has_queue = state.dictation.queue_len().await > 0;
+        {
+            let mut tray = state.dictation_tray_state.lock().await;
+            if has_queue {
+                tray.state = "processing".to_string();
+                tray.phase_started = Some(Instant::now());
+            } else {
+                tray.state = "idle".to_string();
+                tray.phase_started = None;
+            }
+            tray.queue_len = state.dictation.queue_len().await;
+        }
+        refresh_tray(state).await;
+        recompute_and_emit_app_status(state).await;
+        state.dictation.process_queue(state, app_handle).await;
+        {
+            let mut tray = state.dictation_tray_state.lock().await;
+            tray.state = "idle".to_string();
+            tray.phase_started = None;
+            tray.queue_len = 0;
+        }
+        refresh_tray(state).await;
+        recompute_and_emit_app_status(state).await;
+        Ok(())
+    }
+}
+
 fn openstt_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -918,8 +1001,7 @@ fn venv_python_path() -> PathBuf {
 }
 
 fn mlx_supported() -> bool {
-    matches!(std::env::consts::ARCH, "aarch64" | "arm64")
-        && std::env::consts::OS == "macos"
+    matches!(std::env::consts::ARCH, "aarch64" | "arm64") && std::env::consts::OS == "macos"
 }
 
 async fn run_python_check(python: &str, args: &[&str]) -> bool {
@@ -946,8 +1028,7 @@ async fn mlx_dependency_status_inner() -> MlxDependencyStatus {
     }
 
     let python = python_command();
-    let python_ok = run_python_check(&python, &["-c", "import sys"])
-        .await;
+    let python_ok = run_python_check(&python, &["-c", "import sys"]).await;
     let mlx_audio = if python_ok {
         run_python_check(&python, &["-c", "import mlx_audio"]).await
     } else {
@@ -969,7 +1050,9 @@ async fn mlx_dependency_status_inner() -> MlxDependencyStatus {
 }
 
 #[tauri::command]
-async fn mlx_dependency_status(state: TauriState<'_, AppState>) -> Result<MlxDependencyStatus, String> {
+async fn mlx_dependency_status(
+    state: TauriState<'_, AppState>,
+) -> Result<MlxDependencyStatus, String> {
     let status = mlx_dependency_status_inner().await;
     *state.mlx_ready.lock().await = status.ready;
     recompute_and_emit_app_status(&state).await;
@@ -1010,7 +1093,8 @@ async fn download_standalone_python(logs: &LogStore) -> Result<(), String> {
             last_log = Instant::now();
             if let Some(total) = total_size {
                 let pct = (data.len() as f64 / total as f64 * 100.0) as u32;
-                logs.push("info", format!("Downloading Python: {pct}%")).await;
+                logs.push("info", format!("Downloading Python: {pct}%"))
+                    .await;
             } else {
                 logs.push(
                     "info",
@@ -1075,7 +1159,9 @@ async fn ensure_python(state: &AppState) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<MlxDependencyStatus, String> {
+async fn mlx_install_dependencies(
+    state: TauriState<'_, AppState>,
+) -> Result<MlxDependencyStatus, String> {
     if !mlx_supported() {
         return Err("MLX runtime requires Apple Silicon".to_string());
     }
@@ -1090,7 +1176,10 @@ async fn mlx_install_dependencies(state: TauriState<'_, AppState>) -> Result<Mlx
             .await
             .map_err(|err| format!("Failed to create venv: {err}"))?;
         if !status.success() {
-            return Err("Failed to create Python venv. Make sure python3 has the venv module installed.".to_string());
+            return Err(
+                "Failed to create Python venv. Make sure python3 has the venv module installed."
+                    .to_string(),
+            );
         }
     }
 
@@ -1326,7 +1415,9 @@ async fn mlx_health(port: u16) -> bool {
 async fn ensure_mlx_sidecar(state: &AppState, model_id: &str) -> Result<u16, String> {
     let existing = {
         let guard = state.mlx_sidecar.lock().await;
-        guard.as_ref().map(|sidecar| (sidecar.model_id.clone(), sidecar.port))
+        guard
+            .as_ref()
+            .map(|sidecar| (sidecar.model_id.clone(), sidecar.port))
     };
 
     if let Some((existing_model, existing_port)) = existing {
@@ -1510,10 +1601,15 @@ pub(crate) async fn transcribe_bytes(
 
         // Extract ElevenLabs model ID (e.g., "elevenlabs:scribe_v2" -> "scribe_v2")
         let elevenlabs_model = model_id.strip_prefix("elevenlabs:").unwrap_or("scribe_v2");
-        let text = elevenlabs_transcribe(&api_key, &file_bytes, elevenlabs_model, language.as_deref()).await?;
+        let text =
+            elevenlabs_transcribe(&api_key, &file_bytes, elevenlabs_model, language.as_deref())
+                .await?;
         state
             .logs
-            .push("info", format!("Transcription complete: {} chars", text.len()))
+            .push(
+                "info",
+                format!("Transcription complete: {} chars", text.len()),
+            )
             .await;
         return Ok(text);
     }
@@ -1532,9 +1628,7 @@ pub(crate) async fn transcribe_bytes(
         .logs
         .push(
             "info",
-            format!(
-                "Transcription request model={model_id} file={file_label} bytes={size_label}"
-            ),
+            format!("Transcription request model={model_id} file={file_label} bytes={size_label}"),
         )
         .await;
 
@@ -1543,8 +1637,8 @@ pub(crate) async fn transcribe_bytes(
         .and_then(|name| Path::new(name).extension())
         .and_then(|value| value.to_str())
         .unwrap_or("bin");
-    let temp_path = std::env::temp_dir()
-        .join(format!("openstt-upload-{}.{}", now_millis(), extension));
+    let temp_path =
+        std::env::temp_dir().join(format!("openstt-upload-{}.{}", now_millis(), extension));
     if let Err(err) = tokio::fs::write(&temp_path, &file_bytes).await {
         let message = format!("Failed to write temp file: {err}");
         state.logs.push("error", message.clone()).await;
@@ -1559,8 +1653,8 @@ pub(crate) async fn transcribe_bytes(
                 return Err(TranscribeError::internal(err));
             }
         };
-        let marker = models::model_path(&dir, &model_id)
-            .ok_or_else(|| format!("Unknown model: {model_id}"));
+        let marker =
+            models::model_path(&dir, &model_id).ok_or_else(|| format!("Unknown model: {model_id}"));
         let marker = match marker {
             Ok(path) => path,
             Err(err) => {
@@ -1668,9 +1762,11 @@ pub(crate) async fn transcribe_bytes(
                 .map_err(|err| format!("Failed to read segment text: {err:?}"))?;
             text.push_str(&segment);
         }
-        Ok::<(String, Arc<WhisperContext>, WhisperState), String>(
-            (text.trim().to_string(), context, wstate),
-        )
+        Ok::<(String, Arc<WhisperContext>, WhisperState), String>((
+            text.trim().to_string(),
+            context,
+            wstate,
+        ))
     })
     .await;
 
@@ -1712,7 +1808,9 @@ async fn resolve_models_dir(state: &AppState) -> Result<PathBuf, String> {
 
 fn hf_cache_dir_for(model_id: &str) -> PathBuf {
     let folder = model_id.replace('/', "--");
-    mlx_cache_dir().join("hub").join(format!("models--{folder}"))
+    mlx_cache_dir()
+        .join("hub")
+        .join(format!("models--{folder}"))
 }
 
 async fn build_status(state: &AppState) -> ServerStatus {
@@ -1753,7 +1851,10 @@ async fn start_server_inner(app_state: AppState, port: u16) -> Result<ServerStat
     *app_state.requests.lock().await = 0;
     app_state
         .logs
-        .push("info", format!("Gateway starting on http://127.0.0.1:{port}"))
+        .push(
+            "info",
+            format!("Gateway starting on http://127.0.0.1:{port}"),
+        )
         .await;
 
     let router = Router::new()
@@ -1877,9 +1978,15 @@ fn check_all_permissions() -> Result<PermissionStatus, String> {
 #[tauri::command]
 async fn open_permission_settings(target: String) -> Result<(), String> {
     let url = match target.as_str() {
-        "input_monitoring" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent",
-        "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
-        "accessibility" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "input_monitoring" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        }
+        "microphone" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        }
+        "accessibility" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        }
         _ => return Err(format!("Unknown permission target: {target}")),
     };
     Command::new("open")
@@ -1899,15 +2006,15 @@ async fn test_elevenlabs_api_key(api_key: String) -> Result<bool, String> {
         0x57, 0x41, 0x56, 0x45, // "WAVE"
         0x66, 0x6D, 0x74, 0x20, // "fmt "
         0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
-        0x01, 0x00,             // AudioFormat (1 = PCM)
-        0x01, 0x00,             // NumChannels (1 = mono)
+        0x01, 0x00, // AudioFormat (1 = PCM)
+        0x01, 0x00, // NumChannels (1 = mono)
         0x80, 0x3E, 0x00, 0x00, // SampleRate (16000)
         0x00, 0x7D, 0x00, 0x00, // ByteRate (32000)
-        0x02, 0x00,             // BlockAlign (2)
-        0x10, 0x00,             // BitsPerSample (16)
+        0x02, 0x00, // BlockAlign (2)
+        0x10, 0x00, // BitsPerSample (16)
         0x64, 0x61, 0x74, 0x61, // "data"
         0x02, 0x00, 0x00, 0x00, // Subchunk2Size (2 bytes)
-        0x00, 0x00,             // 1 sample of silence
+        0x00, 0x00, // 1 sample of silence
     ];
 
     let client = reqwest::Client::new();
@@ -1946,10 +2053,7 @@ async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn start_server(
-    state: TauriState<'_, AppState>,
-    port: u16,
-) -> Result<ServerStatus, String> {
+async fn start_server(state: TauriState<'_, AppState>, port: u16) -> Result<ServerStatus, String> {
     start_server_inner((*state).clone(), port).await
 }
 
@@ -1994,10 +2098,15 @@ async fn set_ui_settings(
         save_ui_settings(&path, &settings)?;
     }
     if let Some(app_handle) = state.app_handle.lock().await.clone() {
-        if let Err(err) = register_dictation_shortcut(&app_handle, &state, &settings.dictation_shortcut).await {
+        if let Err(err) =
+            register_dictation_shortcut(&app_handle, &state, &settings.dictation_shortcut).await
+        {
             state
                 .logs
-                .push("error", format!("Failed to update dictation shortcut: {err}"))
+                .push(
+                    "error",
+                    format!("Failed to update dictation shortcut: {err}"),
+                )
                 .await;
         }
     }
@@ -2035,10 +2144,14 @@ struct DictationStateResponse {
 
 #[tauri::command]
 async fn start_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
-    state.dictation.start_recording()?;
-    if let Some(app_handle) = state.app_handle.lock().await.clone() {
-        state.dictation.emit_state(&app_handle).await;
-    }
+    let app_handle = state
+        .app_handle
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "App handle not available".to_string())?;
+    start_dictation_inner(&state, &app_handle).await?;
+    state.dictation.emit_state(&app_handle).await;
     let mut tray_state = state.dictation_tray_state.lock().await;
     tray_state.state = "listening".to_string();
     tray_state.queue_len = state.dictation.queue_len().await;
@@ -2051,39 +2164,13 @@ async fn start_dictation(state: TauriState<'_, AppState>) -> Result<(), String> 
 
 #[tauri::command]
 async fn stop_dictation(state: TauriState<'_, AppState>) -> Result<(), String> {
-    state.dictation.stop_recording().await?;
-    if let Some(app_handle) = state.app_handle.lock().await.clone() {
-        state.dictation.emit_state(&app_handle).await;
-    }
-    let has_queue = state.dictation.queue_len().await > 0;
-    {
-        let mut tray_state = state.dictation_tray_state.lock().await;
-        if has_queue {
-            tray_state.state = "processing".to_string();
-            tray_state.phase_started = Some(Instant::now());
-        } else {
-            tray_state.state = "idle".to_string();
-            tray_state.phase_started = None;
-        }
-        tray_state.queue_len = state.dictation.queue_len().await;
-    }
-    refresh_tray(&state).await;
-    recompute_and_emit_app_status(&state).await;
-    let app_state = (*state).clone();
-    let app_handle = state.app_handle.lock().await.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Some(app_handle) = app_handle {
-            app_state.dictation.process_queue(&app_state, &app_handle).await;
-            {
-                let mut tray_state = app_state.dictation_tray_state.lock().await;
-                tray_state.state = "idle".to_string();
-                tray_state.phase_started = None;
-                tray_state.queue_len = 0;
-            }
-            refresh_tray(&app_state).await;
-            recompute_and_emit_app_status(&app_state).await;
-        }
-    });
+    let app_handle = state
+        .app_handle
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "App handle not available".to_string())?;
+    stop_dictation_inner(&state, &app_handle).await?;
     Ok(())
 }
 
@@ -2097,7 +2184,10 @@ async fn stop_playground_recording(state: TauriState<'_, AppState>) -> Result<()
     let app_state = (*state).clone();
     let app_handle = state.app_handle.lock().await.clone();
     tauri::async_runtime::spawn(async move {
-        let result = app_state.dictation.stop_playground_and_transcribe(&app_state).await;
+        let result = app_state
+            .dictation
+            .stop_playground_and_transcribe(&app_state)
+            .await;
         if let Some(app_handle) = app_handle {
             let _ = app_handle.emit("playground-transcription-result", result);
         }
@@ -2106,7 +2196,9 @@ async fn stop_playground_recording(state: TauriState<'_, AppState>) -> Result<()
 }
 
 #[tauri::command]
-async fn get_dictation_state(state: TauriState<'_, AppState>) -> Result<DictationStateResponse, String> {
+async fn get_dictation_state(
+    state: TauriState<'_, AppState>,
+) -> Result<DictationStateResponse, String> {
     Ok(DictationStateResponse {
         state: state.dictation.current_state().as_str().to_string(),
         queue_len: state.dictation.queue_len().await,
@@ -2138,7 +2230,6 @@ async fn paste_clipboard() -> Result<(), String> {
     paste_clipboard_inner().await
 }
 
-
 #[tauri::command]
 async fn list_models(state: TauriState<'_, AppState>) -> Result<Vec<models::ModelInfo>, String> {
     let dir = resolve_models_dir(&*state).await?;
@@ -2146,10 +2237,7 @@ async fn list_models(state: TauriState<'_, AppState>) -> Result<Vec<models::Mode
 }
 
 #[tauri::command]
-async fn download_model(
-    state: TauriState<'_, AppState>,
-    model_id: String,
-) -> Result<(), String> {
+async fn download_model(state: TauriState<'_, AppState>, model_id: String) -> Result<(), String> {
     {
         let mut downloading = state.downloading.lock().await;
         if *downloading {
@@ -2179,10 +2267,10 @@ async fn delete_model(state: TauriState<'_, AppState>, model_id: String) -> Resu
         return Err("Cannot delete the active model".to_string());
     }
     let dir = resolve_models_dir(&*state).await?;
-    let entry = models::model_entry(&model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
-    let path = models::model_path(&dir, &model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let entry =
+        models::model_entry(&model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let path =
+        models::model_path(&dir, &model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
     if entry.engine == models::ModelEngine::Mlx {
         if path.exists() {
             tokio::fs::remove_file(&path)
@@ -2255,7 +2343,13 @@ struct DownloadProgressEvent {
     error: Option<String>,
 }
 
-async fn emit_download_progress_async(state: &AppState, model_id: &str, percent: u32, done: bool, error: Option<String>) {
+async fn emit_download_progress_async(
+    state: &AppState,
+    model_id: &str,
+    percent: u32,
+    done: bool,
+    error: Option<String>,
+) {
     if let Some(app_handle) = state.app_handle.lock().await.clone() {
         let _ = app_handle.emit(
             "download-progress",
@@ -2274,8 +2368,8 @@ async fn download_model_inner(
     model_id: &str,
 ) -> Result<models::ModelInfo, String> {
     let dir = resolve_models_dir(state).await?;
-    let entry = models::model_entry(model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let entry =
+        models::model_entry(model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
     if entry.engine == models::ModelEngine::Mlx {
         prepare_mlx_model(state, &dir, entry).await?;
         let models = models::list_models(&dir);
@@ -2285,8 +2379,8 @@ async fn download_model_inner(
             .ok_or_else(|| "Model info unavailable".to_string());
     }
 
-    let path = models::model_path(&dir, model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let path =
+        models::model_path(&dir, model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
 
     if path.exists() {
         let models = models::list_models(&dir);
@@ -2309,10 +2403,7 @@ async fn download_model_inner(
         .await
         .map_err(|err| format!("Failed to start download: {err}"))?;
     if !response.status().is_success() {
-        return Err(format!(
-            "Download failed with status {}",
-            response.status()
-        ));
+        return Err(format!("Download failed with status {}", response.status()));
     }
 
     let total = response.content_length().unwrap_or(0);
@@ -2348,10 +2439,7 @@ async fn download_model_inner(
             if downloaded >= next_log_at {
                 state
                     .logs
-                    .push(
-                        "info",
-                        format!("Downloading {model_id}: {percent}%"),
-                    )
+                    .push("info", format!("Downloading {model_id}: {percent}%"))
                     .await;
                 next_log_at += 50 * 1024 * 1024;
             }
@@ -2375,14 +2463,14 @@ async fn download_model_inner(
 }
 
 async fn ensure_whisper_model_path(state: &AppState, model_id: &str) -> Result<PathBuf, String> {
-    let entry = models::model_entry(model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let entry =
+        models::model_entry(model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
     if entry.engine != models::ModelEngine::Whisper {
         return Err(format!("Model {model_id} is not a Whisper model"));
     }
     let dir = resolve_models_dir(state).await?;
-    let path = models::model_path(&dir, model_id)
-        .ok_or_else(|| format!("Unknown model: {model_id}"))?;
+    let path =
+        models::model_path(&dir, model_id).ok_or_else(|| format!("Unknown model: {model_id}"))?;
     if path.exists() {
         return Ok(path);
     }
@@ -2443,7 +2531,10 @@ async fn preload_whisper_model(state: &AppState) {
                 context,
                 state: wstate,
             });
-            state.logs.push("info", "Model pre-loaded and ready".to_string()).await;
+            state
+                .logs
+                .push("info", "Model pre-loaded and ready".to_string())
+                .await;
         }
         Ok(Err(err)) => {
             state
@@ -2481,14 +2572,18 @@ async fn preload_mlx_model(state: &AppState) {
         .push("info", format!("Pre-loading MLX model {model_id}…"))
         .await;
     match ensure_mlx_sidecar(state, entry.download_url).await {
-        Ok(port) => state
-            .logs
-            .push("info", format!("MLX sidecar ready on port {port}"))
-            .await,
-        Err(err) => state
-            .logs
-            .push("error", format!("MLX pre-load failed: {err}"))
-            .await,
+        Ok(port) => {
+            state
+                .logs
+                .push("info", format!("MLX sidecar ready on port {port}"))
+                .await
+        }
+        Err(err) => {
+            state
+                .logs
+                .push("error", format!("MLX pre-load failed: {err}"))
+                .await
+        }
     }
 }
 
@@ -2535,10 +2630,7 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn transcribe(
-    AxumState(state): AxumState<AppState>,
-    mut multipart: Multipart,
-) -> Response {
+async fn transcribe(AxumState(state): AxumState<AppState>, mut multipart: Multipart) -> Response {
     let mut file_name: Option<String> = None;
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut model: Option<String> = None;
@@ -2575,8 +2667,7 @@ async fn transcribe(
                             .logs
                             .push("error", format!("Failed reading file: {err}"))
                             .await;
-                        return (StatusCode::BAD_REQUEST, "Invalid file payload")
-                            .into_response();
+                        return (StatusCode::BAD_REQUEST, "Invalid file payload").into_response();
                     }
                 }
             }
@@ -2651,9 +2742,7 @@ async fn transcribe(
         .logs
         .push(
             "info",
-            format!(
-                "Transcription request model={model_id} file={file_label} bytes={size_label}"
-            ),
+            format!("Transcription request model={model_id} file={file_label} bytes={size_label}"),
         )
         .await;
 
@@ -2662,8 +2751,8 @@ async fn transcribe(
         .and_then(|name| Path::new(name).extension())
         .and_then(|value| value.to_str())
         .unwrap_or("bin");
-    let temp_path = std::env::temp_dir()
-        .join(format!("openstt-upload-{}.{}", now_millis(), extension));
+    let temp_path =
+        std::env::temp_dir().join(format!("openstt-upload-{}.{}", now_millis(), extension));
     if let Err(err) = tokio::fs::write(&temp_path, &file_bytes).await {
         let message = format!("Failed to write temp file: {err}");
         state.logs.push("error", message.clone()).await;
@@ -2678,8 +2767,8 @@ async fn transcribe(
                 return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
             }
         };
-        let marker = models::model_path(&dir, &model_id)
-            .ok_or_else(|| format!("Unknown model: {model_id}"));
+        let marker =
+            models::model_path(&dir, &model_id).ok_or_else(|| format!("Unknown model: {model_id}"));
         let marker = match marker {
             Ok(path) => path,
             Err(err) => {
@@ -2843,23 +2932,26 @@ pub fn run() {
                         .with_handler(|app, shortcut, event| {
                             let state = app.state::<AppState>();
                             let current = state.dictation_shortcut.blocking_lock().clone();
-                            if current.as_ref().map(|item| item.id())
-                                != Some(shortcut.id())
-                            {
+                            if current.as_ref().map(|item| item.id()) != Some(shortcut.id()) {
                                 return;
                             }
                             let app_state = (*state).clone();
                             let app_handle = app.clone();
                             match event.state() {
                                 ShortcutState::Pressed => {
-                                    if let Err(err) = app_state.dictation.start_recording() {
-                                        let logs = app_state.logs.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            logs.push("error", format!("Dictation start failed: {err}")).await;
-                                        });
-                                        return;
-                                    }
                                     tauri::async_runtime::spawn(async move {
+                                        if let Err(err) =
+                                            start_dictation_inner(&app_state, &app_handle).await
+                                        {
+                                            app_state
+                                                .logs
+                                                .push(
+                                                    "error",
+                                                    format!("Dictation start failed: {err}"),
+                                                )
+                                                .await;
+                                            return;
+                                        }
                                         app_state.dictation.emit_state(&app_handle).await;
                                         let mut tray = app_state.dictation_tray_state.lock().await;
                                         tray.state = "listening".to_string();
@@ -2871,32 +2963,19 @@ pub fn run() {
                                     });
                                 }
                                 ShortcutState::Released => {
+                                    eprintln!("[lib] global shortcut: key released");
                                     tauri::async_runtime::spawn(async move {
-                                        let _ = app_state.dictation.stop_recording().await;
-                                        app_state.dictation.emit_state(&app_handle).await;
-                                        let has_queue = app_state.dictation.queue_len().await > 0;
+                                        if let Err(err) =
+                                            stop_dictation_inner(&app_state, &app_handle).await
                                         {
-                                            let mut tray = app_state.dictation_tray_state.lock().await;
-                                            if has_queue {
-                                                tray.state = "processing".to_string();
-                                                tray.phase_started = Some(Instant::now());
-                                            } else {
-                                                tray.state = "idle".to_string();
-                                                tray.phase_started = None;
-                                            }
-                                            tray.queue_len = app_state.dictation.queue_len().await;
+                                            app_state
+                                                .logs
+                                                .push(
+                                                    "error",
+                                                    format!("Dictation stop failed: {err}"),
+                                                )
+                                                .await;
                                         }
-                                        refresh_tray(&app_state).await;
-                                        recompute_and_emit_app_status(&app_state).await;
-                                        app_state.dictation.process_queue(&app_state, &app_handle).await;
-                                        {
-                                            let mut tray = app_state.dictation_tray_state.lock().await;
-                                            tray.state = "idle".to_string();
-                                            tray.phase_started = None;
-                                            tray.queue_len = 0;
-                                        }
-                                        refresh_tray(&app_state).await;
-                                        recompute_and_emit_app_status(&app_state).await;
                                     });
                                 }
                             }
@@ -2936,11 +3015,15 @@ pub fn run() {
                     .clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(err) =
-                        register_dictation_shortcut(&app_handle, &state_clone, &dictation_shortcut).await
+                        register_dictation_shortcut(&app_handle, &state_clone, &dictation_shortcut)
+                            .await
                     {
                         state_clone
                             .logs
-                            .push("error", format!("Failed to register dictation shortcut: {err}"))
+                            .push(
+                                "error",
+                                format!("Failed to register dictation shortcut: {err}"),
+                            )
                             .await;
                     }
                 });
@@ -2953,7 +3036,9 @@ pub fn run() {
             }
             let config = load_app_config(&config_path);
             let normalized_model = normalize_model_id(&config.active_model_id);
-            let config_model = if models::model_entry(&normalized_model).is_some() {
+            let is_elevenlabs = normalized_model.starts_with("elevenlabs:");
+            let config_model = if is_elevenlabs || models::model_entry(&normalized_model).is_some()
+            {
                 normalized_model
             } else {
                 default_model_id()
@@ -2985,9 +3070,9 @@ pub fn run() {
                 let port = *state.port.blocking_lock();
                 let model_id = state.active_model_id.blocking_lock().clone();
                 let dictation = state.dictation_tray_state.blocking_lock().clone();
-                let dictation_elapsed = dictation.phase_started.map(|started| {
-                    format!("{:.1}s", started.elapsed().as_secs_f64())
-                });
+                let dictation_elapsed = dictation
+                    .phase_started
+                    .map(|started| format!("{:.1}s", started.elapsed().as_secs_f64()));
                 TraySnapshot {
                     running,
                     port,
@@ -3000,33 +3085,37 @@ pub fn run() {
             let tray_menu = build_tray_menu(app.handle(), &snapshot)?;
             let mut tray_builder = TrayIconBuilder::with_id(TRAY_ID)
                 .menu(&tray_menu)
-                .on_menu_event(|app, event: tauri::menu::MenuEvent| match event.id().as_ref() {
-                    TRAY_OPEN => show_main_window(app),
-                    TRAY_START => {
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let state = app_handle.state::<AppState>();
-                            let port = *state.port.lock().await;
-                            let _ = start_server_inner((*state).clone(), port).await;
-                        });
-                    }
-                    TRAY_STOP => {
-                        let app_handle = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let state = app_handle.state::<AppState>();
-                            let _ = stop_server_inner((*state).clone()).await;
-                        });
-                    }
-                    TRAY_SETTINGS => open_page(app, "settings"),
-                    TRAY_LOGS => open_page(app, "logs"),
-                    TRAY_QUIT => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray: &tauri::tray::TrayIcon<tauri::Wry>, event: TrayIconEvent| {
-                    if let TrayIconEvent::DoubleClick { .. } = event {
-                        show_main_window(tray.app_handle());
-                    }
-                });
+                .on_menu_event(
+                    |app, event: tauri::menu::MenuEvent| match event.id().as_ref() {
+                        TRAY_OPEN => show_main_window(app),
+                        TRAY_START => {
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = app_handle.state::<AppState>();
+                                let port = *state.port.lock().await;
+                                let _ = start_server_inner((*state).clone(), port).await;
+                            });
+                        }
+                        TRAY_STOP => {
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = app_handle.state::<AppState>();
+                                let _ = stop_server_inner((*state).clone()).await;
+                            });
+                        }
+                        TRAY_SETTINGS => open_page(app, "settings"),
+                        TRAY_LOGS => open_page(app, "logs"),
+                        TRAY_QUIT => app.exit(0),
+                        _ => {}
+                    },
+                )
+                .on_tray_icon_event(
+                    |tray: &tauri::tray::TrayIcon<tauri::Wry>, event: TrayIconEvent| {
+                        if let TrayIconEvent::DoubleClick { .. } = event {
+                            show_main_window(tray.app_handle());
+                        }
+                    },
+                );
             if let Some(icon) = app.default_window_icon().cloned() {
                 tray_builder = tray_builder.icon(icon);
             }
@@ -3052,9 +3141,9 @@ pub fn run() {
                         if dictation.state == "idle" {
                             continue;
                         }
-                        let elapsed = dictation.phase_started.map(|started| {
-                            format!("{:.1}s", started.elapsed().as_secs_f64())
-                        });
+                        let elapsed = dictation
+                            .phase_started
+                            .map(|started| format!("{:.1}s", started.elapsed().as_secs_f64()));
                         let title = format_dictation_state(&dictation.state, &elapsed);
                         let app_handle = state_for_ticker.app_handle.lock().await.clone();
                         if let Some(app_handle) = app_handle {
@@ -3117,7 +3206,6 @@ pub fn run() {
             clear_logs,
             get_ui_settings,
             set_ui_settings,
-
             transcribe_audio,
             paste_clipboard,
             start_dictation,

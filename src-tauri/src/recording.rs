@@ -1,10 +1,16 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::mpsc;
 
 pub struct RecordingSession {
     stream: cpal::Stream,
     buffer: Arc<StdMutex<Vec<f32>>>,
     sample_rate: u32,
+}
+
+pub struct StreamingRecordingSession {
+    stream: cpal::Stream,
+    pub sample_rate: u32,
 }
 
 // Safety: RecordingSession is always protected by a StdMutex and accessed
@@ -84,9 +90,7 @@ impl RecordingSession {
                             let mut buf = buf_clone.lock().unwrap();
                             if channels == 1 {
                                 for &sample in data {
-                                    buf.push(
-                                        (sample as f32 / u16::MAX as f32) * 2.0 - 1.0,
-                                    );
+                                    buf.push((sample as f32 / u16::MAX as f32) * 2.0 - 1.0);
                                 }
                             } else {
                                 for chunk in data.chunks(channels) {
@@ -121,6 +125,107 @@ impl RecordingSession {
         drop(self.stream);
         let samples = self.buffer.lock().unwrap().clone();
         (samples, self.sample_rate)
+    }
+}
+
+// Safety: Same as RecordingSession
+unsafe impl Send for StreamingRecordingSession {}
+unsafe impl Sync for StreamingRecordingSession {}
+
+impl StreamingRecordingSession {
+    /// Start a streaming recording session that sends audio chunks via the channel
+    pub fn start(chunk_tx: mpsc::Sender<Vec<i16>>) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| "No input device available".to_string())?;
+        let config = device
+            .default_input_config()
+            .map_err(|err| format!("Failed to get input config: {err}"))?;
+        let sample_rate = config.sample_rate().0;
+        let channels = config.channels() as usize;
+
+        // Buffer to accumulate samples before sending (send every ~100ms)
+        let chunk_size = (sample_rate as usize) / 10; // 100ms of audio
+        let pending: Arc<StdMutex<Vec<i16>>> =
+            Arc::new(StdMutex::new(Vec::with_capacity(chunk_size)));
+        let pending_clone = Arc::clone(&pending);
+        let chunk_tx_clone = chunk_tx.clone();
+
+        let err_fn = |err: cpal::StreamError| {
+            eprintln!("[streaming recording] stream error: {err}");
+        };
+
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => device
+                .build_input_stream(
+                    &config.into(),
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let mut pending = pending_clone.lock().unwrap();
+                        for chunk in data.chunks(channels) {
+                            let sum: f32 = chunk.iter().sum();
+                            let mono = sum / channels as f32;
+                            let clamped = mono.clamp(-1.0, 1.0);
+                            let int_val = if clamped < 0.0 {
+                                (clamped * 0x8000 as f32) as i16
+                            } else {
+                                (clamped * 0x7FFF as f32) as i16
+                            };
+                            pending.push(int_val);
+                        }
+                        if pending.len() >= chunk_size {
+                            let samples: Vec<i16> = pending.drain(..).collect();
+                            let tx = chunk_tx_clone.clone();
+                            // Fire and forget - don't block the audio callback
+                            let _ = tx.try_send(samples);
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .map_err(|err| format!("Failed to build input stream: {err}"))?,
+            cpal::SampleFormat::I16 => {
+                let pending_clone = Arc::clone(&pending);
+                let chunk_tx_clone = chunk_tx.clone();
+                device
+                    .build_input_stream(
+                        &config.into(),
+                        move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                            let mut pending = pending_clone.lock().unwrap();
+                            if channels == 1 {
+                                pending.extend_from_slice(data);
+                            } else {
+                                for chunk in data.chunks(channels) {
+                                    let sum: i32 = chunk.iter().map(|&s| s as i32).sum();
+                                    pending.push((sum / channels as i32) as i16);
+                                }
+                            }
+                            if pending.len() >= chunk_size {
+                                let samples: Vec<i16> = pending.drain(..).collect();
+                                let tx = chunk_tx_clone.clone();
+                                let _ = tx.try_send(samples);
+                            }
+                        },
+                        err_fn,
+                        None,
+                    )
+                    .map_err(|err| format!("Failed to build input stream: {err}"))?
+            }
+            format => return Err(format!("Unsupported sample format: {format:?}")),
+        };
+
+        stream
+            .play()
+            .map_err(|err| format!("Failed to start recording: {err}"))?;
+
+        Ok(Self {
+            stream,
+            sample_rate,
+        })
+    }
+
+    pub fn stop(self) {
+        drop(self.stream);
     }
 }
 
