@@ -1418,6 +1418,7 @@ struct ElevenLabsResponse {
 async fn elevenlabs_transcribe(
     api_key: &str,
     audio_bytes: &[u8],
+    elevenlabs_model: &str,
     language: Option<&str>,
 ) -> Result<String, TranscribeError> {
     let client = reqwest::Client::new();
@@ -1430,7 +1431,7 @@ async fn elevenlabs_transcribe(
                 .mime_str("audio/wav")
                 .unwrap(),
         )
-        .text("model_id", "scribe_v2");
+        .text("model_id", elevenlabs_model.to_string());
 
     if let Some(lang) = language {
         form = form.text("language_code", lang.to_string());
@@ -1507,7 +1508,9 @@ pub(crate) async fn transcribe_bytes(
             return Err(TranscribeError::bad_request(message));
         }
 
-        let text = elevenlabs_transcribe(&api_key, &file_bytes, language.as_deref()).await?;
+        // Extract ElevenLabs model ID (e.g., "elevenlabs:scribe_v2" -> "scribe_v2")
+        let elevenlabs_model = model_id.strip_prefix("elevenlabs:").unwrap_or("scribe_v2");
+        let text = elevenlabs_transcribe(&api_key, &file_bytes, elevenlabs_model, language.as_deref()).await?;
         state
             .logs
             .push("info", format!("Transcription complete: {} chars", text.len()))
