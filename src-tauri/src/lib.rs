@@ -3,6 +3,7 @@ mod dictation;
 pub mod elevenlabs_realtime;
 mod models;
 mod recording;
+pub mod soniox_realtime;
 
 use axum::{
     extract::{Multipart, State as AxumState},
@@ -212,6 +213,10 @@ struct UiSettings {
     dictation_shortcut: DictationShortcut,
     dictation_auto_paste: bool,
     elevenlabs_api_key: String,
+    soniox_api_key: String,
+    soniox_warm_connection: bool,
+    soniox_warm_connection_minutes: u32,
+    soniox_warm_connection_forever: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -238,6 +243,10 @@ impl Default for UiSettings {
             dictation_shortcut: DictationShortcut::default(),
             dictation_auto_paste: true,
             elevenlabs_api_key: String::new(),
+            soniox_api_key: String::new(),
+            soniox_warm_connection: false,
+            soniox_warm_connection_minutes: 5,
+            soniox_warm_connection_forever: false,
         }
     }
 }
@@ -844,7 +853,14 @@ async fn recompute_and_emit_app_status(state: &AppState) {
 }
 
 fn is_realtime_model(model_id: &str) -> bool {
-    model_id == "elevenlabs:scribe_v2_realtime"
+    model_id == "elevenlabs:scribe_v2_realtime" || model_id == "soniox:stt-rt-v4"
+}
+
+fn is_supported_cloud_model(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "elevenlabs:scribe_v2" | "elevenlabs:scribe_v2_realtime" | "soniox:stt-rt-v4"
+    )
 }
 
 async fn start_dictation_inner(
@@ -857,18 +873,38 @@ async fn start_dictation_inner(
     if is_realtime_model(&model_id) {
         eprintln!("[lib] is realtime model, starting realtime");
         let settings = state.ui_settings.lock().await;
-        let api_key = settings.elevenlabs_api_key.clone();
         let language = settings.language.clone();
+
+        // Choose API key based on model type
+        let (api_key, provider) = if model_id.starts_with("soniox:") {
+            let key = settings.soniox_api_key.clone();
+            (key, "soniox")
+        } else {
+            let key = settings.elevenlabs_api_key.clone();
+            (key, "elevenlabs")
+        };
         drop(settings);
 
         if api_key.is_empty() {
-            return Err("ElevenLabs API key not configured".to_string());
+            return Err(format!("{} API key not configured", provider).to_string());
         }
 
-        state
+        eprintln!("[lib] starting {} realtime session with key_len={}", provider, api_key.len());
+        
+        match state
             .dictation
-            .start_realtime(&api_key, Some(language), app_handle.clone())
+            .start_realtime(provider, &api_key, Some(language), app_handle.clone())
             .await
+        {
+            Ok(_) => {
+                eprintln!("[lib] {} realtime session started successfully", provider);
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[lib] {} realtime session failed: {}", provider, e);
+                Err(e)
+            }
+        }
     } else {
         eprintln!("[lib] not realtime model, starting normal recording");
         state.dictation.start_recording()
@@ -880,11 +916,27 @@ async fn stop_dictation_inner(
     app_handle: &tauri::AppHandle,
 ) -> Result<(), String> {
     eprintln!("[lib] stop_dictation_inner called");
-    let is_realtime = state.dictation.is_realtime_active().await;
-    eprintln!("[lib] is_realtime_active returned: {}", is_realtime);
-    if is_realtime {
-        eprintln!("[lib] calling stop_realtime");
-        state.dictation.stop_realtime().await?;
+    let active_model = state.active_model_id.lock().await.clone();
+    let model_id = normalize_model_id(&active_model);
+
+    if is_realtime_model(&model_id) {
+        eprintln!("[lib] active model is realtime, calling stop_realtime");
+        let soniox_warm_policy = if model_id.starts_with("soniox:") {
+            let settings = state.ui_settings.lock().await;
+            if !settings.soniox_warm_connection {
+                dictation::SonioxWarmPolicy::Off
+            } else if settings.soniox_warm_connection_forever {
+                dictation::SonioxWarmPolicy::Forever
+            } else if settings.soniox_warm_connection_minutes > 0 {
+                dictation::SonioxWarmPolicy::WindowMinutes(settings.soniox_warm_connection_minutes)
+            } else {
+                dictation::SonioxWarmPolicy::Off
+            }
+        } else {
+            dictation::SonioxWarmPolicy::Off
+        };
+
+        state.dictation.stop_realtime(soniox_warm_policy).await?;
         eprintln!("[lib] stop_realtime completed");
         // Update UI state
         state.dictation.emit_state(app_handle).await;
@@ -1552,6 +1604,262 @@ async fn elevenlabs_transcribe(
     Ok(result.text)
 }
 
+#[derive(Deserialize)]
+struct SonioxFileUploadResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct SonioxCreateTranscriptionResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct SonioxTranscriptionStatusResponse {
+    status: String,
+    #[serde(default)]
+    error_message: String,
+}
+
+#[derive(Deserialize)]
+struct SonioxTranscriptToken {
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct SonioxTranscriptResponse {
+    #[serde(default)]
+    tokens: Vec<SonioxTranscriptToken>,
+}
+
+async fn soniox_transcribe_async(
+    api_key: &str,
+    audio_bytes: &[u8],
+    file_name: &str,
+    model: &str,
+    language: Option<&str>,
+) -> Result<String, TranscribeError> {
+    let client = reqwest::Client::new();
+    let auth = format!("Bearer {}", api_key);
+
+    // 1) Upload file
+    let upload_form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+
+    let upload_res = client
+        .post("https://api.soniox.com/v1/files")
+        .header("Authorization", &auth)
+        .multipart(upload_form)
+        .send()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    if !upload_res.status().is_success() {
+        let error = upload_res.text().await.unwrap_or_default();
+        return Err(TranscribeError::internal(format!(
+            "Soniox upload error: {}",
+            error
+        )));
+    }
+
+    let upload: SonioxFileUploadResponse = upload_res
+        .json()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    let file_id = upload.id;
+
+    // 2) Create transcription (async)
+    let mut body = serde_json::json!({
+        "model": model,
+        "file_id": file_id.clone(),
+    });
+    if let Some(lang) = language {
+        body["language_hints"] = serde_json::json!([lang]);
+    }
+
+    let create_res = client
+        .post("https://api.soniox.com/v1/transcriptions")
+        .header("Authorization", &auth)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    if !create_res.status().is_success() {
+        let error = create_res.text().await.unwrap_or_default();
+        // Best-effort cleanup of uploaded file.
+        let _ = client
+            .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+            .header("Authorization", &auth)
+            .send()
+            .await;
+        return Err(TranscribeError::internal(format!(
+            "Soniox create transcription error: {}",
+            error
+        )));
+    }
+
+    let created: SonioxCreateTranscriptionResponse = create_res
+        .json()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+    let transcription_id_value = created.id;
+
+    // 3) Poll until completed
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if Instant::now() > deadline {
+            // Best-effort cleanup
+            let _ = client
+                .delete(format!(
+                    "https://api.soniox.com/v1/transcriptions/{}",
+                    transcription_id_value
+                ))
+                .header("Authorization", &auth)
+                .send()
+                .await;
+            let _ = client
+                .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+                .header("Authorization", &auth)
+                .send()
+                .await;
+            return Err(TranscribeError::internal(
+                "Soniox transcription timed out".to_string(),
+            ));
+        }
+
+        let status_res = client
+            .get(format!(
+                "https://api.soniox.com/v1/transcriptions/{}",
+                transcription_id_value
+            ))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+        if !status_res.status().is_success() {
+            let error = status_res.text().await.unwrap_or_default();
+            // Best-effort cleanup
+            let _ = client
+                .delete(format!(
+                    "https://api.soniox.com/v1/transcriptions/{}",
+                    transcription_id_value
+                ))
+                .header("Authorization", &auth)
+                .send()
+                .await;
+            let _ = client
+                .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+                .header("Authorization", &auth)
+                .send()
+                .await;
+            return Err(TranscribeError::internal(format!(
+                "Soniox status error: {}",
+                error
+            )));
+        }
+
+        let status: SonioxTranscriptionStatusResponse = status_res
+            .json()
+            .await
+            .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+        match status.status.as_str() {
+            "completed" => {
+                break;
+            }
+            "error" => {
+                // Best-effort cleanup
+                let _ = client
+                    .delete(format!(
+                        "https://api.soniox.com/v1/transcriptions/{}",
+                        transcription_id_value
+                    ))
+                    .header("Authorization", &auth)
+                    .send()
+                    .await;
+                let _ = client
+                    .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+                    .header("Authorization", &auth)
+                    .send()
+                    .await;
+                return Err(TranscribeError::internal(format!(
+                    "Soniox transcription failed: {}",
+                    status.error_message
+                )));
+            }
+            _ => {
+                sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    // 4) Fetch transcript
+    let transcript_res = client
+        .get(format!(
+            "https://api.soniox.com/v1/transcriptions/{}/transcript",
+            transcription_id_value
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    if !transcript_res.status().is_success() {
+        let error = transcript_res.text().await.unwrap_or_default();
+        // Best-effort cleanup
+        let _ = client
+            .delete(format!(
+                "https://api.soniox.com/v1/transcriptions/{}",
+                transcription_id_value
+            ))
+            .header("Authorization", &auth)
+            .send()
+            .await;
+        let _ = client
+            .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+            .header("Authorization", &auth)
+            .send()
+            .await;
+        return Err(TranscribeError::internal(format!(
+            "Soniox transcript error: {}",
+            error
+        )));
+    }
+
+    let transcript: SonioxTranscriptResponse = transcript_res
+        .json()
+        .await
+        .map_err(|e| TranscribeError::internal(e.to_string()))?;
+
+    let text = transcript.tokens.iter().map(|t| t.text.as_str()).collect::<String>();
+
+    // Best-effort cleanup
+    let _ = client
+        .delete(format!(
+            "https://api.soniox.com/v1/transcriptions/{}",
+            transcription_id_value
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("https://api.soniox.com/v1/files/{}", file_id))
+        .header("Authorization", &auth)
+        .send()
+        .await;
+
+    Ok(text.trim().to_string())
+}
+
 pub(crate) async fn transcribe_bytes(
     state: &AppState,
     model: Option<String>,
@@ -1604,6 +1912,59 @@ pub(crate) async fn transcribe_bytes(
         let text =
             elevenlabs_transcribe(&api_key, &file_bytes, elevenlabs_model, language.as_deref())
                 .await?;
+        state
+            .logs
+            .push(
+                "info",
+                format!("Transcription complete: {} chars", text.len()),
+            )
+            .await;
+        return Ok(text);
+    }
+
+    // Handle Soniox cloud models
+    if model_id.starts_with("soniox:") {
+        let file_label = file_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let size_label = file_bytes.len().to_string();
+        state
+            .logs
+            .push(
+                "info",
+                format!(
+                    "Transcription request model={model_id} file={file_label} bytes={size_label}"
+                ),
+            )
+            .await;
+
+        let api_key = state.ui_settings.lock().await.soniox_api_key.clone();
+        if api_key.is_empty() {
+            let message = "Soniox API key not configured".to_string();
+            state.logs.push("error", message.clone()).await;
+            return Err(TranscribeError::bad_request(message));
+        }
+
+        let upload_name = file_name.clone().unwrap_or_else(|| "audio.bin".to_string());
+        let requested = model_id
+            .strip_prefix("soniox:")
+            .unwrap_or("stt-async-v4")
+            .to_string();
+
+        // File transcription uses the async API.
+        // We only allow async models here; everything else maps to async v4.
+        let soniox_model = if requested.starts_with("stt-async") {
+            requested.as_str()
+        } else {
+            "stt-async-v4"
+        };
+
+        let text = soniox_transcribe_async(
+            &api_key,
+            &file_bytes,
+            &upload_name,
+            soniox_model,
+            language.as_deref(),
+        )
+        .await?;
         state
             .logs
             .push(
@@ -2048,6 +2409,19 @@ async fn test_elevenlabs_api_key(api_key: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn test_soniox_api_key(api_key: String) -> Result<bool, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://api.soniox.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(response.status().is_success())
+}
+
+#[tauri::command]
 async fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     app.restart();
 }
@@ -2093,6 +2467,7 @@ async fn set_ui_settings(
     state: TauriState<'_, AppState>,
     settings: UiSettings,
 ) -> Result<UiSettings, String> {
+    let previous = state.ui_settings.lock().await.clone();
     *state.ui_settings.lock().await = settings.clone();
     if let Some(path) = state.settings_path.lock().await.clone() {
         save_ui_settings(&path, &settings)?;
@@ -2108,6 +2483,46 @@ async fn set_ui_settings(
                     format!("Failed to update dictation shortcut: {err}"),
                 )
                 .await;
+        }
+    }
+
+    // Soniox warm-connection lifecycle
+    let previous_warm_enabled = previous.soniox_warm_connection
+        && (previous.soniox_warm_connection_forever
+            || previous.soniox_warm_connection_minutes > 0);
+    let warm_enabled = settings.soniox_warm_connection
+        && (settings.soniox_warm_connection_forever || settings.soniox_warm_connection_minutes > 0);
+    if previous_warm_enabled && !warm_enabled {
+        state.dictation.close_realtime_session().await;
+    }
+
+    // If user enabled forever mode and Soniox realtime is active, proactively
+    // establish the WebSocket so dictation starts instantly.
+    if settings.soniox_warm_connection
+        && settings.soniox_warm_connection_forever
+        && !settings.soniox_api_key.is_empty()
+    {
+        let model_id = state.active_model_id.lock().await.clone();
+        if model_id == "soniox:stt-rt-v4" {
+            let dictation = state.dictation.clone();
+            let logs = state.logs.clone();
+            let api_key = settings.soniox_api_key.clone();
+            let language = Some(settings.language.clone());
+            tauri::async_runtime::spawn(async move {
+                logs.push("info", "Starting Soniox warm connection (forever)".to_string())
+                    .await;
+                if let Err(err) = dictation
+                    .ensure_soniox_warm_connection(
+                        &api_key,
+                        language,
+                        dictation::SonioxWarmPolicy::Forever,
+                    )
+                    .await
+                {
+                    logs.push("error", format!("Soniox warm connection failed: {err}"))
+                        .await;
+                }
+            });
         }
     }
     Ok(settings)
@@ -2140,6 +2555,25 @@ async fn transcribe_audio(
 struct DictationStateResponse {
     state: String,
     queue_len: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SonioxRealtimeStatusResponse {
+    connected: bool,
+    warm_until_ms: Option<u64>,
+    warm_forever: bool,
+}
+
+#[tauri::command]
+async fn get_soniox_realtime_status(
+    state: TauriState<'_, AppState>,
+) -> Result<SonioxRealtimeStatusResponse, String> {
+    Ok(SonioxRealtimeStatusResponse {
+        connected: state.dictation.soniox_realtime_connected().await,
+        warm_until_ms: state.dictation.soniox_warm_until_ms().await,
+        warm_forever: state.dictation.soniox_warm_forever().await,
+    })
 }
 
 #[tauri::command]
@@ -2308,14 +2742,52 @@ async fn set_active_model(
     state: TauriState<'_, AppState>,
     model_id: String,
 ) -> Result<String, String> {
-    let model_id = normalize_model_id(&model_id);
-    // Allow ElevenLabs cloud models or catalog models
-    let is_elevenlabs = model_id.starts_with("elevenlabs:");
-    if !is_elevenlabs && models::model_entry(&model_id).is_none() {
+    let mut model_id = normalize_model_id(&model_id);
+
+    // Backward-compat: Soniox async model was removed from the UI.
+    if model_id == "soniox:stt-async-v4" {
+        model_id = "soniox:stt-rt-v4".to_string();
+    }
+
+    // Allow supported cloud models or catalog models
+    let is_cloud_model = is_supported_cloud_model(&model_id);
+    if !is_cloud_model && models::model_entry(&model_id).is_none() {
         return Err(format!("Unknown model: {model_id}"));
     }
     *state.active_model_id.lock().await = model_id.clone();
     *state.cached_context.lock().await = None;
+
+    // If we switched away from Soniox realtime, close any warm WS session.
+    if model_id != "soniox:stt-rt-v4" {
+        state.dictation.close_realtime_session().await;
+    } else {
+        // If Soniox realtime is active and forever warm is enabled, pre-connect.
+        let settings = state.ui_settings.lock().await.clone();
+        if settings.soniox_warm_connection
+            && settings.soniox_warm_connection_forever
+            && !settings.soniox_api_key.is_empty()
+        {
+            let dictation = state.dictation.clone();
+            let logs = state.logs.clone();
+            let api_key = settings.soniox_api_key.clone();
+            let language = Some(settings.language.clone());
+            tauri::async_runtime::spawn(async move {
+                logs.push("info", "Starting Soniox warm connection (forever)".to_string())
+                    .await;
+                if let Err(err) = dictation
+                    .ensure_soniox_warm_connection(
+                        &api_key,
+                        language,
+                        dictation::SonioxWarmPolicy::Forever,
+                    )
+                    .await
+                {
+                    logs.push("error", format!("Soniox warm connection failed: {err}"))
+                        .await;
+                }
+            });
+        }
+    }
     if let Some(path) = state.config_path.lock().await.clone() {
         let config = AppConfig {
             active_model_id: model_id.clone(),
@@ -3035,10 +3507,13 @@ pub fn run() {
                 *config_guard = Some(config_path.clone());
             }
             let config = load_app_config(&config_path);
-            let normalized_model = normalize_model_id(&config.active_model_id);
-            let is_elevenlabs = normalized_model.starts_with("elevenlabs:");
-            let config_model = if is_elevenlabs || models::model_entry(&normalized_model).is_some()
-            {
+            let mut normalized_model = normalize_model_id(&config.active_model_id);
+            if normalized_model == "soniox:stt-async-v4" {
+                normalized_model = "soniox:stt-rt-v4".to_string();
+            }
+
+            let is_cloud = is_supported_cloud_model(&normalized_model);
+            let config_model = if is_cloud || models::model_entry(&normalized_model).is_some() {
                 normalized_model
             } else {
                 default_model_id()
@@ -3046,6 +3521,78 @@ pub fn run() {
             {
                 let mut model_guard = state.active_model_id.blocking_lock();
                 *model_guard = config_model;
+            }
+
+            // If Soniox realtime is active and forever warm is enabled, pre-connect.
+            {
+                let state_clone = (*state).clone();
+                tauri::async_runtime::spawn(async move {
+                    let model_id = state_clone.active_model_id.lock().await.clone();
+                    if model_id != "soniox:stt-rt-v4" {
+                        return;
+                    }
+                    let settings = state_clone.ui_settings.lock().await.clone();
+                    if !settings.soniox_warm_connection
+                        || !settings.soniox_warm_connection_forever
+                        || settings.soniox_api_key.is_empty()
+                    {
+                        return;
+                    }
+                    state_clone
+                        .logs
+                        .push("info", "Starting Soniox warm connection (forever)".to_string())
+                        .await;
+                    if let Err(err) = state_clone
+                        .dictation
+                        .ensure_soniox_warm_connection(
+                            &settings.soniox_api_key,
+                            Some(settings.language),
+                            dictation::SonioxWarmPolicy::Forever,
+                        )
+                        .await
+                    {
+                        state_clone
+                            .logs
+                            .push("error", format!("Soniox warm connection failed: {err}"))
+                            .await;
+                    }
+                });
+            }
+
+            // Background supervisor: keep Soniox warm connection alive when
+            // forever mode is enabled (handles 300-minute stream limit).
+            {
+                let state_clone = (*state).clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(15)).await;
+                        let model_id = state_clone.active_model_id.lock().await.clone();
+                        if model_id != "soniox:stt-rt-v4" {
+                            continue;
+                        }
+                        let settings = state_clone.ui_settings.lock().await.clone();
+                        if !settings.soniox_warm_connection
+                            || !settings.soniox_warm_connection_forever
+                            || settings.soniox_api_key.is_empty()
+                        {
+                            continue;
+                        }
+                        if state_clone.dictation.soniox_realtime_connected().await {
+                            continue;
+                        }
+                        if let Err(err) = state_clone
+                            .dictation
+                            .ensure_soniox_warm_connection(
+                                &settings.soniox_api_key,
+                                Some(settings.language),
+                                dictation::SonioxWarmPolicy::Forever,
+                            )
+                            .await
+                        {
+                            eprintln!("[soniox] warm supervisor ensure failed: {}", err);
+                        }
+                    }
+                });
             }
 
             let model_dir = models_dir();
@@ -3213,6 +3760,7 @@ pub fn run() {
             start_playground_recording,
             stop_playground_recording,
             get_dictation_state,
+            get_soniox_realtime_status,
             list_models,
             download_model,
             delete_model,
@@ -3226,7 +3774,8 @@ pub fn run() {
             check_all_permissions,
             open_permission_settings,
             restart_app,
-            test_elevenlabs_api_key
+            test_elevenlabs_api_key,
+            test_soniox_api_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

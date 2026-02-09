@@ -31,6 +31,16 @@ type UiSettings = {
   dictationShortcut: DictationShortcut;
   dictationAutoPaste: boolean;
   elevenlabsApiKey: string;
+  sonioxApiKey: string;
+  sonioxWarmConnection: boolean;
+  sonioxWarmConnectionMinutes: number;
+  sonioxWarmConnectionForever: boolean;
+};
+
+type SonioxRealtimeStatus = {
+  connected: boolean;
+  warmUntilMs: number | null;
+  warmForever: boolean;
 };
 
 type DictationShortcut = {
@@ -210,7 +220,7 @@ const translations = {
     pageModels: "Models",
     pageLogs: "Logs",
     pageSettings: "Settings",
-    pageOverviewDesc: "Service control and API surface",
+    pageOverviewDesc: "System status dashboard",
     pageModelsDesc: "Manage speech-to-text models",
     pageLogsDesc: "Recent gateway activity",
     pageSettingsDesc: "Preferences and accessibility",
@@ -219,8 +229,8 @@ const translations = {
     requests: "Requests",
     port: "Port",
     model: "Model",
-    serviceControl: "Service Control",
-    serviceControlDesc: "Start or stop the local gateway",
+    serviceControl: "Gateway",
+    serviceControlDesc: "Local gateway status and health",
     start: "Start",
     starting: "Starting...",
     stop: "Stop",
@@ -285,6 +295,26 @@ const translations = {
     elevenlabsApiKey: "ElevenLabs API Key",
     elevenlabsApiKeyHint: "Required for cloud transcription",
     elevenlabsApiKeyPlaceholder: "Enter your API key",
+    sonioxApiKey: "Soniox API Key",
+    sonioxApiKeyHint: "Required for Soniox cloud transcription",
+    sonioxApiKeyPlaceholder: "Enter your API key",
+    sonioxWarmConnection: "Warm Soniox connection",
+    sonioxWarmConnectionHint:
+      "Keep the Soniox connection warm between dictations (billable)",
+    sonioxWarmConnectionMinutes: "Warm window",
+    sonioxWarmConnectionMinutesHint:
+      "After dictation ends, keep the Soniox connection alive for this long (billable)",
+    sonioxWarmConnectionForever: "Always keep alive",
+    sonioxWarmConnectionForeverHint:
+      "Keep the Soniox connection alive until the app exits (billable)",
+    minutesShort: "min",
+    sonioxStatusLabel: "Soniox",
+    sonioxStatusOff: "Off",
+    sonioxStatusUnused: "Unused",
+    sonioxStatusIdle: "Idle",
+    sonioxStatusLive: "Live",
+    sonioxStatusWarm: "Warm",
+    sonioxStatusAlways: "Always",
     testApiKey: "Test",
     testingApiKey: "Testing...",
     apiKeyValid: "Valid",
@@ -296,6 +326,8 @@ const translations = {
     scribeV2Desc: "Best quality batch transcription, 90+ languages",
     scribeV2Realtime: "Scribe v2 Realtime",
     scribeV2RealtimeDesc: "Real-time dictation, ~150ms latency, 90+ languages",
+    sonioxSttRtV4: "Soniox STT-RT v4",
+    sonioxSttRtV4Desc: "Latest real-time dictation, ultra low latency, 100+ languages",
     appearance: "Appearance",
     reducedTransparency: "Reduced transparency",
     reducedTransparencyHint: "Use solid surfaces for better contrast",
@@ -312,6 +344,7 @@ const translations = {
     dictationAutoPasteHint: "Paste transcript to the active app after copying",
     dictationStatus: "Status",
     dictationStatusHint: "Listening and transcription state",
+    statusLabel: "Status",
     dictationIdle: "Idle",
     dictationListening: "Listening",
     dictationProcessing: "Processing",
@@ -331,6 +364,8 @@ const translations = {
     gateway: "Gateway",
     online: "Online",
     modelsSettings: "Models",
+    on: "On",
+    off: "Off",
     activeModel: "Active model",
     available: "Available",
     modelsCount: "{count} models",
@@ -394,7 +429,7 @@ const translations = {
     pageModels: "模型",
     pageLogs: "日志",
     pageSettings: "设置",
-    pageOverviewDesc: "服务控制与 API 概览",
+    pageOverviewDesc: "系统状态总览",
     pageModelsDesc: "管理语音转文字模型",
     pageLogsDesc: "网关最近活动",
     pageSettingsDesc: "偏好设置与辅助选项",
@@ -403,8 +438,8 @@ const translations = {
     requests: "请求",
     port: "端口",
     model: "模型",
-    serviceControl: "服务控制",
-    serviceControlDesc: "启动或停止本地网关",
+    serviceControl: "网关",
+    serviceControlDesc: "本地网关状态与健康检查",
     start: "启动",
     starting: "启动中...",
     stop: "停止",
@@ -469,6 +504,26 @@ const translations = {
     elevenlabsApiKey: "ElevenLabs API 密钥",
     elevenlabsApiKeyHint: "云端转写需要此密钥",
     elevenlabsApiKeyPlaceholder: "输入您的 API 密钥",
+    sonioxApiKey: "Soniox API 密钥",
+    sonioxApiKeyHint: "Soniox 云端转写需要此密钥",
+    sonioxApiKeyPlaceholder: "输入您的 API 密钥",
+    sonioxWarmConnection: "预热 Soniox 连接",
+    sonioxWarmConnectionHint:
+      "在多次听写之间保持 Soniox 连接预热（计费）",
+    sonioxWarmConnectionMinutes: "预热时长",
+    sonioxWarmConnectionMinutesHint:
+      "听写结束后，保持 Soniox 连接存活的时间（计费）",
+    sonioxWarmConnectionForever: "永远保持连接",
+    sonioxWarmConnectionForeverHint:
+      "保持 Soniox 连接直到退出应用（计费）",
+    minutesShort: "分钟",
+    sonioxStatusLabel: "Soniox",
+    sonioxStatusOff: "关闭",
+    sonioxStatusUnused: "未使用",
+    sonioxStatusIdle: "空闲",
+    sonioxStatusLive: "实时",
+    sonioxStatusWarm: "预热",
+    sonioxStatusAlways: "常驻",
     testApiKey: "测试",
     testingApiKey: "测试中...",
     apiKeyValid: "有效",
@@ -480,6 +535,8 @@ const translations = {
     scribeV2Desc: "最佳质量批量转写，支持90+语言",
     scribeV2Realtime: "Scribe v2 实时",
     scribeV2RealtimeDesc: "实时听写，约150ms延迟，支持90+语言",
+    sonioxSttRtV4: "Soniox STT-RT v4",
+    sonioxSttRtV4Desc: "最新实时听写，超低延迟，支持100+语言",
     appearance: "外观",
     reducedTransparency: "减少透明度",
     reducedTransparencyHint: "使用更实的表面以提升对比度",
@@ -496,6 +553,7 @@ const translations = {
     dictationAutoPasteHint: "复制后尝试粘贴到当前应用",
     dictationStatus: "状态",
     dictationStatusHint: "录音与转写状态",
+    statusLabel: "状态",
     dictationIdle: "空闲",
     dictationListening: "录音中",
     dictationProcessing: "转写中",
@@ -515,6 +573,8 @@ const translations = {
     gateway: "网关",
     online: "在线",
     modelsSettings: "模型",
+    on: "开启",
+    off: "关闭",
     activeModel: "当前模型",
     available: "可用",
     modelsCount: "{count} 个模型",
@@ -577,10 +637,12 @@ function App() {
     "stopped" | "loading" | "ready" | "listening" | "transcribing"
   >("stopped");
   const [status, setStatus] = useState<ServerStatus | null>(null);
+  const [sonioxRtStatus, setSonioxRtStatus] =
+    useState<SonioxRealtimeStatus | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [portInput, setPortInput] = useState(String(fallbackPort));
   const [error, setError] = useState<string | null>(null);
-  const [permissionError, setPermissionError] = useState<"microphone" | null>(null);
   const [action, setAction] = useState<"start" | "stop" | null>(null);
   const [copied, setCopied] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -590,6 +652,10 @@ function App() {
     dictationShortcut: defaultDictationShortcut,
     dictationAutoPaste: true,
     elevenlabsApiKey: "",
+    sonioxApiKey: "",
+    sonioxWarmConnection: false,
+    sonioxWarmConnectionMinutes: 5,
+    sonioxWarmConnectionForever: false,
   });
   const [dictationCapture, setDictationCapture] = useState(false);
   const [dictationState, setDictationState] = useState<
@@ -614,6 +680,9 @@ function App() {
     "install" | "setup" | "reset" | null
   >(null);
   const [elevenlabsKeyStatus, setElevenlabsKeyStatus] = useState<
+    "unknown" | "testing" | "valid" | "invalid"
+  >("unknown");
+  const [sonioxKeyStatus, setSonioxKeyStatus] = useState<
     "unknown" | "testing" | "valid" | "invalid"
   >("unknown");
   const [legacyModels, setLegacyModels] = useState<LegacyModelsInfo | null>(null);
@@ -680,6 +749,83 @@ function App() {
     Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort < 65536;
   const isRunning = status?.running ?? false;
   const currentModelId = activeModelId ?? "base";
+  const sonioxSelected = currentModelId === "soniox:stt-rt-v4";
+
+  const warmSonioxEnabled = uiSettings.sonioxWarmConnection
+    ? uiSettings.sonioxWarmConnectionForever ||
+      uiSettings.sonioxWarmConnectionMinutes > 0
+    : false;
+  const sonioxConnected = sonioxRtStatus?.connected ?? false;
+  const sonioxWarmUntilMs = sonioxRtStatus?.warmUntilMs ?? null;
+  const sonioxWarmForever = sonioxRtStatus?.warmForever ?? false;
+  const sonioxWarmRemainingMs = sonioxWarmUntilMs
+    ? sonioxWarmUntilMs - nowMs
+    : null;
+  const showSonioxStatusPill =
+    warmSonioxEnabled || currentModelId === "soniox:stt-rt-v4" || sonioxConnected;
+
+  const formatMmSs = (ms: number) => {
+    const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  };
+
+  const sonioxStatus = (() => {
+    const label = t("sonioxStatusLabel");
+    if (dictationState === "listening" && sonioxSelected) {
+      const value = t("sonioxStatusLive");
+      return {
+        tone: "listening" as const,
+        value,
+        text: `${label}: ${value}`,
+      };
+    }
+
+    if (sonioxConnected && sonioxWarmForever) {
+      const value = `${t("sonioxStatusWarm")} ${t("sonioxStatusAlways")}`;
+      return {
+        tone: "ready" as const,
+        value,
+        text: `${label}: ${value}`,
+      };
+    }
+
+    if (sonioxConnected && sonioxWarmRemainingMs !== null && sonioxWarmRemainingMs > 0) {
+      const value = `${t("sonioxStatusWarm")} ${formatMmSs(sonioxWarmRemainingMs)}`;
+      return {
+        tone: "ready" as const,
+        value,
+        text: `${label}: ${value}`,
+      };
+    }
+
+    if (sonioxConnected) {
+      const value = t("sonioxStatusIdle");
+      return {
+        tone: "ready" as const,
+        value,
+        text: `${label}: ${value}`,
+      };
+    }
+
+    if (sonioxSelected) {
+      const value = t(warmSonioxEnabled ? "sonioxStatusIdle" : "sonioxStatusOff");
+      return {
+        tone: "stopped" as const,
+        value,
+        text: `${label}: ${value}`,
+      };
+    }
+
+    // When Soniox isn't the active model, don't present "Idle".
+    const value = t("sonioxStatusUnused");
+    return {
+      tone: "stopped" as const,
+      value,
+      text: `${label}: ${value}`,
+    };
+  })();
   const endpointBase = status?.url
     ? status.url
     : `http://127.0.0.1:${portValid ? parsedPort : fallbackPort}`;
@@ -697,6 +843,17 @@ function App() {
       }
     } catch (err) {
       setError(String(err));
+    }
+  };
+
+  const refreshSonioxRtStatus = async () => {
+    try {
+      const next = await invoke<SonioxRealtimeStatus>(
+        "get_soniox_realtime_status",
+      );
+      setSonioxRtStatus(next);
+    } catch {
+      // Ignore transient failures (offline, disabled, etc.)
     }
   };
 
@@ -750,6 +907,7 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void refreshSonioxRtStatus();
     void refreshLogs();
     void refreshModels();
     void refreshMlxDeps();
@@ -771,6 +929,14 @@ function App() {
           dictationShortcut:
             settings.dictationShortcut ?? defaultDictationShortcut,
           dictationAutoPaste: settings.dictationAutoPaste ?? true,
+          sonioxWarmConnection: settings.sonioxWarmConnection ?? false,
+          sonioxWarmConnectionMinutes:
+            Math.min(
+              60,
+              Math.max(1, Math.floor(settings.sonioxWarmConnectionMinutes ?? 5)),
+            ),
+          sonioxWarmConnectionForever:
+            settings.sonioxWarmConnectionForever ?? false,
         });
       } catch (err) {
         setError(String(err));
@@ -778,7 +944,13 @@ function App() {
     })();
     const timer = setInterval(() => {
       void refreshStatus();
+      void refreshSonioxRtStatus();
     }, 2000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
 
@@ -871,6 +1043,16 @@ function App() {
       size: "Cloud",
       description: t("scribeV2RealtimeDesc"),
       engine: "elevenlabs",
+      downloaded: true,
+      downloadUrl: "",
+      localPath: null,
+    },
+    {
+      id: "soniox:stt-rt-v4",
+      name: t("sonioxSttRtV4"),
+      size: "Cloud",
+      description: t("sonioxSttRtV4Desc"),
+      engine: "soniox",
       downloaded: true,
       downloadUrl: "",
       localPath: null,
@@ -1275,6 +1457,22 @@ function App() {
     }
   };
 
+  const handleTestSonioxKey = async () => {
+    setSonioxKeyStatus("testing");
+    try {
+      const valid = await invoke<boolean>("test_soniox_api_key", {
+        apiKey: uiSettings.sonioxApiKey,
+      });
+      setSonioxKeyStatus(valid ? "valid" : "invalid");
+      if (valid) {
+        // Save settings only after successful test
+        await invoke("set_ui_settings", { settings: uiSettings });
+      }
+    } catch {
+      setSonioxKeyStatus("invalid");
+    }
+  };
+
   const handleActivateModel = async (modelId: string) => {
     setError(null);
     setModelAction({ id: modelId, type: "activate" });
@@ -1374,35 +1572,6 @@ function App() {
                 );
               })}
             </nav>
-            <div className="sidebar-footer">
-              <div className="sidebar-status">
-                <div className={`status-pill is-${isRunning ? "ready" : "stopped"}`}>
-                  <span className="status-dot" />
-                  {t("gateway")}: {isRunning ? t("running") : t("stopped")}
-                </div>
-                <div className={`status-pill is-${dictationState === "idle" ? (mlxReady ? "ready" : "loading") : dictationState === "listening" ? "listening" : "transcribing"}`}>
-                  <span className="status-dot" />
-                  {dictationState === "idle" ? (mlxReady ? t("dictationIdle") : t("runtimeMissing")) : dictationState === "listening" ? t("dictationListening") : t("dictationProcessing")}
-                  {dictationState !== "idle" && (
-                    <button
-                      className="stop-button-inline"
-                      onClick={() => invoke("stop_dictation")}
-                      aria-label={t("stopDictation")}
-                    >
-                      <Square size={8} fill="currentColor" />
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="sidebar-meta">
-                <span>{t("port")}</span>
-                <span>{status?.port ?? fallbackPort}</span>
-              </div>
-              <div className="sidebar-meta">
-                <span>{t("model")}</span>
-                <span>{currentModelId}</span>
-              </div>
-            </div>
           </div>
         </aside>
 
@@ -1490,36 +1659,6 @@ function App() {
                           : t("runtimeUnsupported")}
                     </span>
                   </div>
-                  <div className="settings-group">
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">
-                          {t("runtimeTitle")}
-                        </div>
-                      </div>
-                      <div className="badge-row">
-                        {mlxSupported && !mlxReady && (
-                          <button
-                            className="button tiny primary"
-                            onClick={handleInstallMlx}
-                            disabled={mlxAction === "install"}
-                          >
-                            {mlxAction === "install"
-                              ? t("runtimeInstalling")
-                              : t("runtimeInstall")}
-                          </button>
-                        )}
-                        {(mlxAction === "install" || mlxAction === "setup") && (
-                          <button
-                            className="button tiny ghost"
-                            onClick={() => setActivePage("logs")}
-                          >
-                            {t("viewLogs")}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
                 </div>
 
                 {/* Model */}
@@ -1548,12 +1687,6 @@ function App() {
                             ? (models.find((m) => m.id === activeModelId)?.name ?? activeModelId)
                             : t("noActiveModel")}
                         </span>
-                        <button
-                          className="button tiny"
-                          onClick={() => setActivePage("models")}
-                        >
-                          {t("dictationShortcutChange")}
-                        </button>
                       </div>
                     </div>
                   </div>
@@ -1570,26 +1703,31 @@ function App() {
                   <div className="settings-group">
                     <div className="settings-row">
                       <div>
+                        <div className="settings-label">{t("dictationStatus")}</div>
+                        <div className="settings-hint">
+                          {t("dictationStatusHint")}
+                        </div>
+                      </div>
+                      <span className="status-chip">
+                        {dictationState === "listening"
+                          ? t("dictationListening")
+                          : dictationState === "processing"
+                            ? t("dictationProcessing")
+                            : t("dictationIdle")}
+                      </span>
+                    </div>
+
+                    <div className="settings-row">
+                      <div>
                         <div className="settings-label">
                           {t("dictationShortcutLabel")}
                         </div>
                       </div>
-                      <div className="badge-row">
-                        <span className="badge">
-                          {dictationCapture
-                            ? t("dictationShortcutListening")
-                            : formatShortcutLabel(uiSettings.dictationShortcut)}
-                        </span>
-                        <button
-                          className="button tiny"
-                          onClick={() => setDictationCapture(!dictationCapture)}
-                        >
-                          {dictationCapture
-                            ? t("done")
-                            : t("dictationShortcutChange")}
-                        </button>
-                      </div>
+                      <span className="badge">
+                        {formatShortcutLabel(uiSettings.dictationShortcut)}
+                      </span>
                     </div>
+
                     <div className="settings-row">
                       <div>
                         <div className="settings-label">
@@ -1599,75 +1737,46 @@ function App() {
                           {t("dictationAutoPasteHint")}
                         </div>
                       </div>
-                      <button
-                        className={`switch ${
-                          uiSettings.dictationAutoPaste ? "is-on" : ""
+                      <span
+                        className={`status-chip ${
+                          uiSettings.dictationAutoPaste ? "is-online" : ""
                         }`}
-                        onClick={() =>
-                          persistSettings({
-                            ...uiSettings,
-                            dictationAutoPaste: !uiSettings.dictationAutoPaste,
-                          })
-                        }
-                        aria-pressed={uiSettings.dictationAutoPaste}
                       >
-                        <span className="switch-thumb" />
-                      </button>
+                        {uiSettings.dictationAutoPaste ? t("on") : t("off")}
+                      </span>
                     </div>
-                  </div>
-                </div>
 
-                {/* Playground */}
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("playgroundTitle")}</h2>
-                      <p className="muted">{t("playgroundDesc")}</p>
-                    </div>
-                    <div className="badge-row">
-                      {playgroundStatus !== "idle" && (
-                        <span className="badge">
-                          {playgroundStatus === "recording"
-                            ? t("playgroundRecording")
-                            : t("playgroundTranscribing")}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="settings-group">
                     <div className="settings-row">
                       <div>
                         <div className="settings-label">
-                          {t("playgroundRecord")}
+                          {t("sonioxWarmConnection")}
                         </div>
                       </div>
-                      <div className="badge-row">
-                        <button
-                          className="button tiny primary"
-                          onClick={startPlaygroundRecording}
-                          disabled={playgroundStatus !== "idle"}
-                        >
-                          {t("playgroundRecord")}
-                        </button>
-                        <button
-                          className="button tiny"
-                          onClick={stopPlaygroundAndTranscribe}
-                          disabled={playgroundStatus !== "recording"}
-                        >
-                          {t("playgroundStop")}
-                        </button>
-                      </div>
+                      <span className="status-chip">
+                        {uiSettings.sonioxWarmConnection
+                          ? uiSettings.sonioxWarmConnectionForever
+                            ? `${t("sonioxStatusWarm")} ${t("sonioxStatusAlways")}`
+                            : `${uiSettings.sonioxWarmConnectionMinutes} ${t(
+                                "minutesShort",
+                              )}`
+                          : t("off")}
+                      </span>
                     </div>
-                    {playgroundText && (
-                      <div className="settings-row">
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div className="settings-label">
-                            {t("playgroundPlaceholder")}
-                          </div>
-                          <div className="settings-hint">{playgroundText}</div>
+
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("sonioxStatusLabel")}
                         </div>
                       </div>
-                    )}
+                      <span
+                        className={`status-chip ${
+                          sonioxStatus.tone === "stopped" ? "" : "is-online"
+                        }`}
+                      >
+                        {sonioxStatus.value}
+                      </span>
+                    </div>
                   </div>
                 </div>
 
@@ -1688,36 +1797,27 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="server-controls">
-                    <div className="field">
-                      <label htmlFor="port">{t("port")}</label>
-                      <input
-                        id="port"
-                        type="text"
-                        inputMode="numeric"
-                        value={portInput}
-                        onChange={(event) => setPortInput(event.target.value)}
-                        disabled={isRunning}
-                      />
-                    {!portValid && (
-                      <span className="input-hint">{t("portHint")}</span>
-                    )}
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("gateway")}</div>
+                        <div className="settings-hint">
+                          {isRunning
+                            ? t("listeningOn", {
+                                url: status?.url ?? "localhost",
+                              })
+                            : t("stopped")}
+                        </div>
+                      </div>
+                      <span
+                        className={`status-chip ${
+                          isRunning ? "is-online" : "is-offline"
+                        }`}
+                      >
+                        {isRunning ? t("online") : t("offline")}
+                      </span>
+                    </div>
                   </div>
-                  <button
-                    className="button primary"
-                    onClick={handleStart}
-                    disabled={isRunning || action === "start"}
-                  >
-                    {action === "start" ? t("starting") : t("start")}
-                  </button>
-                  <button
-                    className="button ghost"
-                    onClick={handleStop}
-                    disabled={!isRunning || action === "stop"}
-                  >
-                    {action === "stop" ? t("stopping") : t("stop")}
-                  </button>
-                </div>
 
                   <div className="server-meta">
                     <div className="meta-row">
@@ -1740,52 +1840,6 @@ function App() {
                     </div>
                   </div>
 
-                  {permissionError === "microphone" && (
-                    <div className="error-banner permission-error">
-                      <span>{t("microphonePermissionDenied")}</span>
-                      <button
-                        className="small"
-                        onClick={() => {
-                          setPermissionError(null);
-                          handleOpenPermissionSettings("microphone");
-                        }}
-                      >
-                        {t("openMicrophoneSettings")}
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                {/* Endpoints */}
-                <div className="card">
-                  <div className="card-header">
-                    <div>
-                      <h2>{t("endpoints")}</h2>
-                      <p className="muted">{t("endpointsDesc")}</p>
-                    </div>
-                    <div className="pill">{t("openai")}</div>
-                  </div>
-
-                  <div className="endpoint-list">
-                    <div className="endpoint">
-                      <div className="endpoint-title">{t("transcriptions")}</div>
-                      <div className="endpoint-desc">
-                        {t("transcriptionsDesc")}
-                      </div>
-                      <div className="endpoint-actions">
-                        <code className="endpoint-code">{curlCommand}</code>
-                        <button className="button tiny" onClick={handleCopy}>
-                          {copied ? t("copied") : t("copy")}
-                        </button>
-                      </div>
-                    </div>
-                    <div className="endpoint">
-                      <div className="endpoint-title">{t("healthEndpoint")}</div>
-                      <div className="endpoint-desc">
-                        {t("healthEndpointDesc")}
-                      </div>
-                    </div>
-                  </div>
                 </div>
 
               </>
@@ -1926,12 +1980,61 @@ function App() {
                         </span>
                       </div>
                     </div>
+                    {/* Soniox API Key */}
+                    <div className="runtime-row" style={{ marginBottom: 12 }}>
+                      <div style={{ flex: 1 }}>
+                        <div className="runtime-title">{t("sonioxApiKey")}</div>
+                        <div className="muted">{t("sonioxApiKeyHint")}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input
+                          type="password"
+                          className="input"
+                          placeholder={t("sonioxApiKeyPlaceholder")}
+                          value={uiSettings.sonioxApiKey}
+                          onChange={(e) => {
+                            const updated = { ...uiSettings, sonioxApiKey: e.target.value };
+                            setUiSettings(updated);
+                            setSonioxKeyStatus("unknown");
+                          }}
+                          style={{ width: 220 }}
+                        />
+                        <button
+                          className="button tiny"
+                          onClick={handleTestSonioxKey}
+                          disabled={!uiSettings.sonioxApiKey || sonioxKeyStatus === "testing"}
+                        >
+                          {sonioxKeyStatus === "testing" ? t("testingApiKey") : t("testApiKey")}
+                        </button>
+                        <span
+                          className={`runtime-status ${
+                            sonioxKeyStatus === "valid"
+                              ? "is-ready"
+                              : sonioxKeyStatus === "invalid"
+                                ? "is-missing"
+                                : ""
+                          }`}
+                        >
+                          {sonioxKeyStatus === "valid"
+                            ? t("apiKeyValid")
+                            : sonioxKeyStatus === "invalid"
+                              ? t("apiKeyInvalid")
+                              : sonioxKeyStatus === "testing"
+                                ? t("testingApiKey")
+                                : uiSettings.sonioxApiKey
+                                  ? t("apiKeyNotVerified")
+                                  : t("apiKeyNotSet")}
+                        </span>
+                      </div>
+                    </div>
                     <div className="model-list">
                       {cloudModels.map((model) => {
                         const isActive = model.id === activeModelId;
                         const isActivating =
                           modelAction?.id === model.id && modelAction.type === "activate";
-                        const hasApiKey = Boolean(uiSettings.elevenlabsApiKey);
+                        const hasApiKey = model.engine === "soniox"
+                          ? Boolean(uiSettings.sonioxApiKey)
+                          : Boolean(uiSettings.elevenlabsApiKey);
                         return (
                           <div
                             key={model.id}
@@ -2372,6 +2475,150 @@ function App() {
                         <span className="switch-thumb" />
                       </button>
                     </div>
+
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("sonioxWarmConnection")}
+                        </div>
+                        <div className="settings-hint">
+                          {t("sonioxWarmConnectionHint")}
+                        </div>
+                      </div>
+                      <button
+                        className={`switch ${
+                          uiSettings.sonioxWarmConnection ? "is-on" : ""
+                        }`}
+                        onClick={() =>
+                          persistSettings({
+                            ...uiSettings,
+                            sonioxWarmConnection: !uiSettings.sonioxWarmConnection,
+                            sonioxWarmConnectionForever:
+                              uiSettings.sonioxWarmConnection
+                                ? false
+                                : uiSettings.sonioxWarmConnectionForever,
+                          })
+                        }
+                        aria-pressed={uiSettings.sonioxWarmConnection}
+                      >
+                        <span className="switch-thumb" />
+                      </button>
+                    </div>
+
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("sonioxWarmConnectionForever")}
+                        </div>
+                        <div className="settings-hint">
+                          {t("sonioxWarmConnectionForeverHint")}
+                        </div>
+                      </div>
+                      <button
+                        className={`switch ${
+                          uiSettings.sonioxWarmConnectionForever ? "is-on" : ""
+                        }`}
+                        onClick={() =>
+                          persistSettings({
+                            ...uiSettings,
+                            sonioxWarmConnectionForever:
+                              !uiSettings.sonioxWarmConnectionForever,
+                          })
+                        }
+                        aria-pressed={uiSettings.sonioxWarmConnectionForever}
+                        disabled={!uiSettings.sonioxWarmConnection}
+                      >
+                        <span className="switch-thumb" />
+                      </button>
+                    </div>
+
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("sonioxWarmConnectionMinutes")}
+                        </div>
+                        <div className="settings-hint">
+                          {t("sonioxWarmConnectionMinutesHint")}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input
+                          type="number"
+                          className="input"
+                          min={1}
+                          max={60}
+                          step={1}
+                          value={uiSettings.sonioxWarmConnectionMinutes}
+                          onChange={(e) => {
+                            const raw = Number(e.target.value);
+                            const next = Number.isFinite(raw)
+                              ? Math.min(60, Math.max(1, Math.floor(raw)))
+                              : 5;
+                            void persistSettings({
+                              ...uiSettings,
+                              sonioxWarmConnectionMinutes: next,
+                            });
+                          }}
+                          disabled={!uiSettings.sonioxWarmConnection || uiSettings.sonioxWarmConnectionForever}
+                          style={{ width: 84 }}
+                        />
+                        <span className="muted">{t("minutesShort")}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card settings-section">
+                  <h3>{t("playgroundTitle")}</h3>
+                  <div className="settings-group">
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">
+                          {t("playgroundRecord")}
+                        </div>
+                        <div className="settings-hint">{t("playgroundDesc")}</div>
+                      </div>
+                      <div className="badge-row">
+                        <button
+                          className="button tiny primary"
+                          onClick={startPlaygroundRecording}
+                          disabled={playgroundStatus !== "idle"}
+                        >
+                          {t("playgroundRecord")}
+                        </button>
+                        <button
+                          className="button tiny"
+                          onClick={stopPlaygroundAndTranscribe}
+                          disabled={playgroundStatus !== "recording"}
+                        >
+                          {t("playgroundStop")}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("statusLabel")}</div>
+                      </div>
+                      <span className="status-chip">
+                        {playgroundStatus === "recording"
+                          ? t("playgroundRecording")
+                          : playgroundStatus === "transcribing"
+                            ? t("playgroundTranscribing")
+                            : t("dictationIdle")}
+                      </span>
+                    </div>
+
+                    {playgroundText && (
+                      <div className="settings-row">
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div className="settings-label">
+                            {t("playgroundPlaceholder")}
+                          </div>
+                          <div className="settings-hint">{playgroundText}</div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -2397,12 +2644,84 @@ function App() {
                         {isRunning ? t("online") : t("offline")}
                       </span>
                     </div>
-                    <div className="settings-row">
-                      <div>
-                        <div className="settings-label">{t("port")}</div>
-                        <div className="settings-hint">
-                          {status?.port ?? fallbackPort}
-                        </div>
+                  </div>
+
+                  <div className="server-controls">
+                    <div className="field">
+                      <label htmlFor="port">{t("port")}</label>
+                      <input
+                        id="port"
+                        type="text"
+                        inputMode="numeric"
+                        value={portInput}
+                        onChange={(event) => setPortInput(event.target.value)}
+                        disabled={isRunning}
+                      />
+                      {!portValid && (
+                        <span className="input-hint">{t("portHint")}</span>
+                      )}
+                    </div>
+                    <button
+                      className="button primary"
+                      onClick={handleStart}
+                      disabled={isRunning || action === "start"}
+                    >
+                      {action === "start" ? t("starting") : t("start")}
+                    </button>
+                    <button
+                      className="button ghost"
+                      onClick={handleStop}
+                      disabled={!isRunning || action === "stop"}
+                    >
+                      {action === "stop" ? t("stopping") : t("stop")}
+                    </button>
+                  </div>
+
+                  <div className="server-meta">
+                    <div className="meta-row">
+                      <span className="meta-label">{t("url")}</span>
+                      <span className="meta-value">
+                        {status?.url ?? t("notRunning")}
+                      </span>
+                    </div>
+                    <div className="meta-row">
+                      <span className="meta-label">{t("started")}</span>
+                      <span className="meta-value">
+                        {formatTimestamp(status?.startedAt)}
+                      </span>
+                    </div>
+                    <div className="meta-row">
+                      <span className="meta-label">{t("requests")}</span>
+                      <span className="meta-value">{status?.requests ?? 0}</span>
+                    </div>
+                    <div className="meta-row">
+                      <span className="meta-label">{t("health")}</span>
+                      <span className="meta-value">
+                        {isRunning ? t("listening") : t("offline")}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="card settings-section">
+                  <h3>{t("endpoints")}</h3>
+                  <div className="endpoint-list">
+                    <div className="endpoint">
+                      <div className="endpoint-title">{t("transcriptions")}</div>
+                      <div className="endpoint-desc">
+                        {t("transcriptionsDesc")}
+                      </div>
+                      <div className="endpoint-actions">
+                        <code className="endpoint-code">{curlCommand}</code>
+                        <button className="button tiny" onClick={handleCopy}>
+                          {copied ? t("copied") : t("copy")}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="endpoint">
+                      <div className="endpoint-title">{t("healthEndpoint")}</div>
+                      <div className="endpoint-desc">
+                        {t("healthEndpointDesc")}
                       </div>
                     </div>
                   </div>
@@ -2445,6 +2764,18 @@ function App() {
                           {t("modelsCount", { count: models.length })}
                         </div>
                       </div>
+                    </div>
+                    <div className="settings-row">
+                      <div>
+                        <div className="settings-label">{t("modelsTitle")}</div>
+                        <div className="settings-hint">{t("modelsDesc")}</div>
+                      </div>
+                      <button
+                        className="button tiny"
+                        onClick={() => setActivePage("models")}
+                      >
+                        {t("manageModels")}
+                      </button>
                     </div>
                   </div>
                   <div className="settings-group">
@@ -2553,6 +2884,66 @@ function App() {
           </div>
         </main>
       </div>
+
+      <footer className="statusbar" data-tauri-drag-region>
+        <div className="statusbar-left" data-tauri-drag-region="false">
+          <div className={`status-pill is-${isRunning ? "ready" : "stopped"}`}>
+            <span className="status-dot" />
+            {t("gateway")}: {isRunning ? t("running") : t("stopped")}
+          </div>
+
+          <div
+            className={`status-pill is-${
+              dictationState === "idle"
+                ? mlxReady
+                  ? "ready"
+                  : "loading"
+                : dictationState === "listening"
+                  ? "listening"
+                  : "transcribing"
+            }`}
+          >
+            <span className="status-dot" />
+            {dictationState === "idle"
+              ? mlxReady
+                ? t("dictationIdle")
+                : t("runtimeMissing")
+              : dictationState === "listening"
+                ? t("dictationListening")
+                : t("dictationProcessing")}
+            {dictationState !== "idle" && (
+              <button
+                className="stop-button-inline"
+                onClick={() => invoke("stop_dictation")}
+                aria-label={t("stopDictation")}
+              >
+                <Square size={8} fill="currentColor" />
+              </button>
+            )}
+          </div>
+
+          {showSonioxStatusPill && (
+            <div className={`status-pill is-${sonioxStatus.tone}`}>
+              <span className="status-dot" />
+              {sonioxStatus.text}
+            </div>
+          )}
+        </div>
+
+        <div className="statusbar-right" data-tauri-drag-region="false">
+          <div className="statusbar-meta">
+            <span className="statusbar-meta-label">{t("port")}</span>
+            <span className="statusbar-meta-value">
+              {status?.port ?? fallbackPort}
+            </span>
+          </div>
+          <div className="statusbar-meta">
+            <span className="statusbar-meta-label">{t("model")}</span>
+            <span className="statusbar-meta-value">{currentModelId}</span>
+          </div>
+        </div>
+      </footer>
+
       <div
         className="drawer-scrim"
         onClick={() => setDrawerOpen(false)}
