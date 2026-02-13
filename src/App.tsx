@@ -14,6 +14,9 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
+import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 import "./App.css";
 
@@ -372,6 +375,15 @@ const translations = {
     about: "About",
     aboutDesc: "Local speech to text gateway",
     build: "Build",
+    checkForUpdates: "Check for Updates",
+    checking: "Checking...",
+    upToDate: "You're up to date",
+    updateAvailable: "Update available: v{version}",
+    installUpdate: "Install Update",
+    updateDownloading: "Downloading... {percent}%",
+    updateInstalling: "Installing...",
+    updateFailed: "Update check failed",
+    retry: "Retry",
     portHint: "Port must be 1-65535",
     overviewModelTitle: "Model",
     overviewModelDesc: "Active transcription model",
@@ -581,6 +593,15 @@ const translations = {
     about: "关于",
     aboutDesc: "本地语音转文字网关",
     build: "版本",
+    checkForUpdates: "检查更新",
+    checking: "检查中...",
+    upToDate: "已是最新版本",
+    updateAvailable: "有新版本: v{version}",
+    installUpdate: "安装更新",
+    updateDownloading: "下载中... {percent}%",
+    updateInstalling: "安装中...",
+    updateFailed: "检查更新失败",
+    retry: "重试",
     portHint: "端口必须在 1-65535 之间",
     overviewModelTitle: "模型",
     overviewModelDesc: "当前转写模型",
@@ -690,6 +711,17 @@ function App() {
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [permissionStatus, setPermissionStatus] = useState<PermissionStatus | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+  const [updateAvailable, setUpdateAvailable] = useState<{
+    version: string;
+    notes?: string;
+    doInstall: () => Promise<void>;
+  } | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateDownloading, setUpdateDownloading] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateUpToDate, setUpdateUpToDate] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [activeModelId, setActiveModelId] = useState<string | null>(null);
   const [modelAction, setModelAction] = useState<{
@@ -947,6 +979,49 @@ function App() {
       void refreshSonioxRtStatus();
     }, 2000);
     return () => clearInterval(timer);
+  }, []);
+
+  // Fetch app version and silently check for updates on startup
+  useEffect(() => {
+    void getVersion().then(setAppVersion).catch(() => {});
+    void (async () => {
+      try {
+        const update = await checkUpdate();
+        if (update) {
+          setUpdateAvailable({
+            version: update.version,
+            notes: update.body ?? undefined,
+            doInstall: async () => {
+              setUpdateDownloading(true);
+              setUpdateProgress(0);
+              setUpdateError(null);
+              let totalBytes = 0;
+              let downloadedBytes = 0;
+              try {
+                await update.downloadAndInstall((event) => {
+                  if (event.event === "Started" && event.data.contentLength) {
+                    totalBytes = event.data.contentLength;
+                  } else if (event.event === "Progress") {
+                    downloadedBytes += event.data.chunkLength;
+                    if (totalBytes > 0) {
+                      setUpdateProgress(
+                        Math.round((downloadedBytes / totalBytes) * 100),
+                      );
+                    }
+                  }
+                });
+                await relaunch();
+              } catch (err) {
+                setUpdateError(String(err));
+                setUpdateDownloading(false);
+              }
+            },
+          });
+        }
+      } catch (_) {
+        /* silent on startup */
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -1266,6 +1341,53 @@ function App() {
       setLogs([]);
     } catch (err) {
       setError(String(err));
+    }
+  };
+
+  const handleCheckUpdate = async () => {
+    setUpdateChecking(true);
+    setUpdateError(null);
+    setUpdateUpToDate(false);
+    try {
+      const update = await checkUpdate();
+      if (update) {
+        setUpdateAvailable({
+          version: update.version,
+          notes: update.body ?? undefined,
+          doInstall: async () => {
+            setUpdateDownloading(true);
+            setUpdateProgress(0);
+            setUpdateError(null);
+            let totalBytes = 0;
+            let downloadedBytes = 0;
+            try {
+              await update.downloadAndInstall((event) => {
+                if (event.event === "Started" && event.data.contentLength) {
+                  totalBytes = event.data.contentLength;
+                } else if (event.event === "Progress") {
+                  downloadedBytes += event.data.chunkLength;
+                  if (totalBytes > 0) {
+                    setUpdateProgress(
+                      Math.round((downloadedBytes / totalBytes) * 100),
+                    );
+                  }
+                }
+              });
+              await relaunch();
+            } catch (err) {
+              setUpdateError(String(err));
+              setUpdateDownloading(false);
+            }
+          },
+        });
+      } else {
+        setUpdateUpToDate(true);
+        setTimeout(() => setUpdateUpToDate(false), 3000);
+      }
+    } catch (err) {
+      setUpdateError(String(err));
+    } finally {
+      setUpdateChecking(false);
     }
   };
 
@@ -2874,9 +2996,88 @@ function App() {
                     <div className="settings-row">
                       <div>
                         <div className="settings-label">{t("build")}</div>
-                        <div className="settings-hint">0.1.0</div>
+                        <div className="settings-hint">{appVersion || "..."}</div>
                       </div>
+                      <button
+                        className="button tiny"
+                        onClick={handleCheckUpdate}
+                        disabled={updateChecking || updateDownloading}
+                      >
+                        {updateChecking ? t("checking") : t("checkForUpdates")}
+                      </button>
                     </div>
+                    {updateUpToDate && !updateAvailable && (
+                      <div className="settings-row">
+                        <div className="settings-hint" style={{ color: "var(--text-success, #34c759)" }}>
+                          {t("upToDate")}
+                        </div>
+                      </div>
+                    )}
+                    {updateError && !updateAvailable && (
+                      <div className="settings-row">
+                        <div className="settings-hint" style={{ color: "var(--text-danger, #c62828)" }}>
+                          {t("updateFailed")}: {updateError}
+                        </div>
+                      </div>
+                    )}
+                    {updateAvailable && (
+                      <div className="settings-row" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+                        <div>
+                          <div className="settings-label">
+                            {t("updateAvailable", { version: updateAvailable.version })}
+                          </div>
+                          {updateAvailable.notes && (
+                            <div className="settings-hint" style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>
+                              {updateAvailable.notes}
+                            </div>
+                          )}
+                        </div>
+                        {updateDownloading ? (
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <div style={{
+                              flex: 1,
+                              height: 4,
+                              borderRadius: 2,
+                              background: "var(--border-muted, #e0e0e0)",
+                              overflow: "hidden",
+                            }}>
+                              <div style={{
+                                width: `${updateProgress}%`,
+                                height: "100%",
+                                borderRadius: 2,
+                                background: "#0a84ff",
+                                transition: "width 0.3s ease",
+                              }} />
+                            </div>
+                            <span style={{ fontSize: 11, color: "var(--text-secondary, #666)" }}>
+                              {updateProgress < 100
+                                ? t("updateDownloading", { percent: updateProgress })
+                                : t("updateInstalling")}
+                            </span>
+                          </div>
+                        ) : (
+                          <button
+                            className="button tiny primary"
+                            onClick={() => void updateAvailable.doInstall()}
+                            disabled={updateDownloading}
+                          >
+                            {t("installUpdate")}
+                          </button>
+                        )}
+                        {updateError && (
+                          <div className="settings-hint" style={{ color: "var(--text-danger, #c62828)" }}>
+                            {updateError}
+                            <button
+                              className="button tiny"
+                              onClick={() => void updateAvailable.doInstall()}
+                              style={{ marginLeft: 8 }}
+                            >
+                              {t("retry")}
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
