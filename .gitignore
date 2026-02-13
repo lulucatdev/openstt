@@ -19,6 +19,8 @@ dist-ssr
 src-tauri/target/
 src-tauri/WixTools/
 src-tauri/Cargo.lock
+src-tauri/Sparkle.framework/
+src-tauri/sparkle-bin/
 
 # Rust
 *.rs.bk

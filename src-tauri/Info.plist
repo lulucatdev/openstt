@@ -4,5 +4,11 @@
   <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Allow access to the microphone for dictation.</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/lulucatdev/openstt/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>jyAD5B3GJI2Jz6gIsBrHdyiuorqRlCUnLSgzt47Ed+Y=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <false/>
   </dict>
 </plist>

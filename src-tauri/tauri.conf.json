@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenSTT",
-  "version": "1.0.9",
+  "version": "1.1.0",
   "identifier": "com.lulucat.openstt",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,7 +39,6 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -48,15 +47,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "infoPlist": "Info.plist"
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE4MkI2QjA4ODFGMDIwQUUKUldTdUlQQ0JDR3NyR0RBd25xa3E5YzJLOGltcEpmYUNhK1N6NFR1VzhoeEtGM0ZTaWc2anJaWHgK",
-      "endpoints": [
-        "https://github.com/lulucatdev/openstt/releases/latest/download/latest.json"
-      ]
+      "infoPlist": "Info.plist",
+      "frameworks": ["Sparkle.framework"]
     }
   }
 }
