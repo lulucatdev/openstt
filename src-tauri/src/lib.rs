@@ -68,6 +68,7 @@ struct AppState {
     dictation_shortcut: Arc<Mutex<Option<Shortcut>>>,
     dictation_tray_state: Arc<Mutex<DictationTrayState>>,
     dictation: Arc<dictation::DictationManager>,
+    dictation_op_lock: Arc<Mutex<()>>,
     downloading: Arc<Mutex<bool>>,
     app_status: Arc<Mutex<AppStatus>>,
 }
@@ -447,6 +448,7 @@ impl AppState {
             dictation_shortcut: Arc::new(Mutex::new(None)),
             dictation_tray_state: Arc::new(Mutex::new(DictationTrayState::default())),
             dictation: Arc::new(dictation::DictationManager::new()),
+            dictation_op_lock: Arc::new(Mutex::new(())),
             downloading: Arc::new(Mutex::new(false)),
             app_status: Arc::new(Mutex::new(AppStatus::Stopped)),
         }
@@ -562,6 +564,7 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                 let app_handle = app.clone();
                 if is_down {
                     tauri::async_runtime::spawn(async move {
+                        let _guard = app_state.dictation_op_lock.lock().await;
                         if let Err(err) = start_dictation_inner(&app_state, &app_handle).await {
                             app_state
                                 .logs
@@ -581,6 +584,7 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                 } else {
                     eprintln!("[lib] modifier event tap: key released");
                     tauri::async_runtime::spawn(async move {
+                        let _guard = app_state.dictation_op_lock.lock().await;
                         if let Err(err) = stop_dictation_inner(&app_state, &app_handle).await {
                             app_state
                                 .logs
@@ -589,7 +593,7 @@ fn start_modifier_event_tap(app: tauri::AppHandle, state: AppState) {
                         }
                     });
                 }
-                Some(event.clone())
+                None
             },
         );
 

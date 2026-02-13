@@ -296,19 +296,27 @@ impl DictationManager {
         {
             let mut guard = self.realtime_session.lock().await;
             if guard.is_none() {
-                let realtime: RealtimeSessionWrapper = match provider {
+                let realtime_result: Result<RealtimeSessionWrapper, String> = match provider {
                     "soniox" => {
-                        let session = SonioxSession::start(api_key, sample_rate, language.clone()).await?;
-                        RealtimeSessionWrapper::Soniox(session)
+                        SonioxSession::start(api_key, sample_rate, language.clone()).await
+                            .map(RealtimeSessionWrapper::Soniox)
                     }
                     _ => {
-                        // Default to ElevenLabs
-                        let session = ElevenLabsSession::start(api_key, sample_rate, language.clone()).await?;
-                        RealtimeSessionWrapper::ElevenLabs(session)
+                        ElevenLabsSession::start(api_key, sample_rate, language.clone()).await
+                            .map(RealtimeSessionWrapper::ElevenLabs)
                     }
                 };
-                *guard = Some(realtime);
-                created_new_session = true;
+                match realtime_result {
+                    Ok(realtime) => {
+                        *guard = Some(realtime);
+                        created_new_session = true;
+                    }
+                    Err(e) => {
+                        drop(guard);
+                        streaming.stop();
+                        return Err(e);
+                    }
+                }
             }
         }
 
@@ -872,7 +880,7 @@ fn type_via_clipboard(text: &str) -> Result<(), String> {
 
     // Cmd+V
     const V_KEYCODE: u16 = 9;
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+    let source = CGEventSource::new(CGEventSourceStateID::Private)
         .map_err(|_| "Failed to create event source".to_string())?;
 
     let down = CGEvent::new_keyboard_event(source.clone(), V_KEYCODE, true)
