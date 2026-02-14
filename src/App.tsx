@@ -402,6 +402,7 @@ const translations = {
     legacyCleaning: "Cleaning...",
     onboardingTitle: "Welcome to OpenSTT",
     onboardingSubtitle: "Grant permissions to enable all features",
+    onboardingPermissionTip: "If a permission is not working, open System Settings, remove OpenSTT from the list (click −), then re-add it (click +), and restart the app.",
     onboardingInputMonitoring: "Input Monitoring",
     onboardingInputMonitoringDesc: "Required for global keyboard shortcut",
     onboardingMicrophone: "Microphone",
@@ -613,6 +614,7 @@ const translations = {
     legacyCleaning: "清理中...",
     onboardingTitle: "欢迎使用 OpenSTT",
     onboardingSubtitle: "授予权限以启用所有功能",
+    onboardingPermissionTip: "如果权限无法生效，请打开系统设置，先将 OpenSTT 从列表中删除（点击 −），再重新添加（点击 +），最后重启应用。",
     onboardingInputMonitoring: "输入监控",
     onboardingInputMonitoringDesc: "全局快捷键需要此权限",
     onboardingMicrophone: "麦克风",
@@ -2985,6 +2987,7 @@ function App() {
           <div className="onboarding-dialog">
             <h2 className="onboarding-title">{t("onboardingTitle")}</h2>
             <p className="onboarding-subtitle">{t("onboardingSubtitle")}</p>
+            <p className="onboarding-subtitle" style={{ fontSize: 11, opacity: 0.7, marginTop: 4 }}>{t("onboardingPermissionTip")}</p>
 
             <div className="onboarding-steps">
               {/* Step 1: Input Monitoring */}
